@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ADA PDF Remediation</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #f0f4f8;
+      color: #1a202c;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 2rem 1rem;
+    }
+
+    header {
+      text-align: center;
+      margin-bottom: 2rem;
+    }
+    header h1 { font-size: 2rem; font-weight: 700; color: #2b6cb0; }
+    header p  { color: #4a5568; margin-top: 0.5rem; }
+
+    .card {
+      background: white;
+      border-radius: 12px;
+      box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+      padding: 2rem;
+      width: 100%;
+      max-width: 680px;
+      margin-bottom: 1.5rem;
+    }
+
+    /* --- Drop zone --- */
+    #drop-zone {
+      border: 2px dashed #90cdf4;
+      border-radius: 10px;
+      padding: 3rem 2rem;
+      text-align: center;
+      cursor: pointer;
+      transition: background 0.2s, border-color 0.2s;
+    }
+    #drop-zone.dragover { background: #ebf8ff; border-color: #3182ce; }
+    #drop-zone svg { width: 48px; height: 48px; color: #90cdf4; margin-bottom: 1rem; }
+    #drop-zone p { color: #718096; }
+    #drop-zone strong { color: #2b6cb0; }
+    #file-input { display: none; }
+
+    /* --- Estimate panel --- */
+    #estimate-panel { display: none; }
+    .estimate-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1rem;
+      margin: 1rem 0;
+    }
+    .stat { background: #f7fafc; border-radius: 8px; padding: 1rem; text-align: center; }
+    .stat .value { font-size: 1.6rem; font-weight: 700; color: #2b6cb0; }
+    .stat .label { font-size: 0.8rem; color: #718096; margin-top: 0.25rem; }
+    .free-badge {
+      display: inline-block;
+      background: #c6f6d5;
+      color: #276749;
+      font-size: 0.75rem;
+      font-weight: 600;
+      padding: 0.15rem 0.5rem;
+      border-radius: 99px;
+      margin-left: 0.4rem;
+      vertical-align: middle;
+    }
+    .warning-box {
+      background: #fffbeb;
+      border: 1px solid #f6e05e;
+      border-radius: 8px;
+      padding: 0.75rem 1rem;
+      color: #744210;
+      font-size: 0.9rem;
+      margin-bottom: 1rem;
+    }
+
+    /* --- Buttons --- */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.65rem 1.4rem;
+      border-radius: 8px;
+      font-weight: 600;
+      font-size: 0.95rem;
+      cursor: pointer;
+      border: none;
+      transition: opacity 0.15s;
+    }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-primary  { background: #3182ce; color: white; }
+    .btn-success  { background: #38a169; color: white; }
+    .btn-outline  { background: white; color: #3182ce; border: 1.5px solid #3182ce; }
+    .btn:not(:disabled):hover { opacity: 0.88; }
+    .btn-row { display: flex; gap: 0.75rem; flex-wrap: wrap; margin-top: 1rem; }
+
+    /* --- Progress --- */
+    #progress-panel { display: none; }
+    .progress-bar-bg {
+      background: #e2e8f0;
+      border-radius: 99px;
+      height: 10px;
+      overflow: hidden;
+      margin: 1rem 0;
+    }
+    .progress-bar-fill {
+      background: #3182ce;
+      height: 100%;
+      border-radius: 99px;
+      transition: width 0.4s ease;
+      width: 0%;
+    }
+    #progress-label { color: #4a5568; font-size: 0.9rem; }
+
+    /* --- Results --- */
+    #result-panel { display: none; }
+    .success-icon { font-size: 3rem; text-align: center; margin-bottom: 0.5rem; }
+    #result-panel h2 { text-align: center; color: #276749; margin-bottom: 1.5rem; }
+
+    /* --- Compliance report --- */
+    #report-panel { display: none; }
+    #report-panel h3 { margin-bottom: 1rem; font-size: 1.1rem; }
+    .issue-list { list-style: none; }
+    .issue-list li {
+      padding: 0.5rem 0.75rem;
+      border-radius: 6px;
+      margin-bottom: 0.4rem;
+      font-size: 0.88rem;
+      line-height: 1.4;
+    }
+    .issue-info    { background: #ebf8ff; color: #2c5282; }
+    .issue-warning { background: #fffbeb; color: #744210; }
+    .issue-error   { background: #fff5f5; color: #742a2a; }
+    .report-summary {
+      font-weight: 600;
+      padding: 0.75rem;
+      border-radius: 8px;
+      margin-top: 1rem;
+      text-align: center;
+    }
+    .report-pass { background: #c6f6d5; color: #276749; }
+    .report-fail { background: #fed7d7; color: #742a2a; }
+
+    /* --- Pricing table --- */
+    .pricing { margin-top: 1rem; }
+    .pricing h3 { margin-bottom: 1rem; font-size: 1rem; color: #4a5568; text-align: center; }
+    .pricing-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+      gap: 0.75rem;
+    }
+    .tier {
+      border: 1.5px solid #e2e8f0;
+      border-radius: 10px;
+      padding: 1rem 0.75rem;
+      text-align: center;
+    }
+    .tier.featured { border-color: #3182ce; background: #ebf8ff; }
+    .tier .tier-name { font-weight: 700; font-size: 0.9rem; color: #2d3748; }
+    .tier .tier-price { font-size: 1.3rem; font-weight: 800; color: #3182ce; margin: 0.3rem 0; }
+    .tier .tier-desc { font-size: 0.75rem; color: #718096; }
+
+    /* --- Alert --- */
+    .alert { padding: 0.75rem 1rem; border-radius: 8px; font-size: 0.9rem; margin-bottom: 1rem; }
+    .alert-success { background: #c6f6d5; color: #276749; }
+    .alert-info    { background: #ebf8ff; color: #2c5282; }
+    .alert-error   { background: #fed7d7; color: #742a2a; }
+
+    footer { color: #a0aec0; font-size: 0.8rem; margin-top: 2rem; text-align: center; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>ADA PDF Remediation</h1>
+  <p>Convert non-compliant PDFs to ADA / PDF-UA accessible documents — free for up to 3 pages</p>
+</header>
+
+{% if cancelled %}
+<div class="card">
+  <div class="alert alert-info">Payment cancelled. Your file was not processed.</div>
+</div>
+{% endif %}
+
+<!-- Upload card -->
+<div class="card">
+  <div id="drop-zone" onclick="document.getElementById('file-input').click()">
+    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+        d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414A1 1 0 0119 9.414V19a2 2 0 01-2 2z"/>
+    </svg>
+    <p><strong>Click to upload</strong> or drag &amp; drop a PDF</p>
+    <p style="font-size:0.8rem;margin-top:0.4rem;">Max 50 MB · PDF only</p>
+  </div>
+  <input type="file" id="file-input" accept=".pdf" />
+
+  <!-- Estimate -->
+  <div id="estimate-panel" style="margin-top:1.5rem;">
+    <div class="estimate-grid">
+      <div class="stat">
+        <div class="value" id="stat-pages">—</div>
+        <div class="label">Pages</div>
+      </div>
+      <div class="stat">
+        <div class="value" id="stat-cost">—</div>
+        <div class="label">Estimated cost</div>
+      </div>
+    </div>
+
+    <div id="large-doc-warning" class="warning-box" style="display:none;"></div>
+    <div id="error-box" class="alert alert-error" style="display:none;"></div>
+
+    <div class="btn-row">
+      <button class="btn btn-primary" id="btn-process" onclick="startProcessing()">
+        ✦ Remediate PDF
+      </button>
+      <button class="btn btn-outline" onclick="resetUpload()">Upload different file</button>
+    </div>
+  </div>
+</div>
+
+<!-- Progress card -->
+<div class="card" id="progress-panel">
+  <h2 style="margin-bottom:0.75rem;">Processing…</h2>
+  <p id="progress-label">Preparing…</p>
+  <div class="progress-bar-bg">
+    <div class="progress-bar-fill" id="progress-fill"></div>
+  </div>
+  <p style="font-size:0.8rem;color:#a0aec0;margin-top:0.5rem;">
+    Using local AI model (free). This may take 1–3 minutes.
+  </p>
+</div>
+
+<!-- Result card -->
+<div class="card" id="result-panel">
+  <div class="success-icon">✅</div>
+  <h2>Remediation Complete</h2>
+
+  <div class="btn-row" style="justify-content:center;">
+    <button class="btn btn-success" id="btn-download" onclick="downloadResult()">
+      ⬇ Download Accessible .docx
+    </button>
+    <button class="btn btn-outline" onclick="resetUpload()">Process another PDF</button>
+  </div>
+
+  <div style="margin-top:1.5rem;padding:1rem;background:#f7fafc;border-radius:8px;font-size:0.85rem;color:#4a5568;">
+    <strong>Next steps:</strong>
+    <ol style="margin-top:0.5rem;padding-left:1.2rem;line-height:1.8;">
+      <li>Open the .docx in <strong>Microsoft Word</strong></li>
+      <li>Run <strong>Review → Check Accessibility</strong> and fix any remaining issues</li>
+      <li>Export: <strong>File → Save As → PDF</strong><br>
+          ✓ Check <em>"Document structure tags for accessibility"</em></li>
+      <li>Validate with <a href="https://pac.pdf-accessibility.org" target="_blank" style="color:#3182ce;">PAC 2026</a></li>
+    </ol>
+  </div>
+</div>
+
+<!-- Compliance report card -->
+<div class="card" id="report-panel">
+  <h3>Compliance Pre-check Report</h3>
+  <ul class="issue-list" id="issue-list"></ul>
+  <div class="report-summary" id="report-summary"></div>
+</div>
+
+<!-- Pricing -->
+<div class="card pricing">
+  <h3>Simple per-page pricing</h3>
+  <div class="pricing-grid">
+    <div class="tier">
+      <div class="tier-name">Free</div>
+      <div class="tier-price">$0</div>
+      <div class="tier-desc">3 pages/month</div>
+    </div>
+    <div class="tier featured">
+      <div class="tier-name">Pay-as-you-go</div>
+      <div class="tier-price">$0.05</div>
+      <div class="tier-desc">per page, no commitment</div>
+    </div>
+    <div class="tier">
+      <div class="tier-name">Pro</div>
+      <div class="tier-price">$19<span style="font-size:0.9rem;font-weight:400;">/mo</span></div>
+      <div class="tier-desc">~200 pages</div>
+    </div>
+    <div class="tier">
+      <div class="tier-name">Business</div>
+      <div class="tier-price">$79<span style="font-size:0.9rem;font-weight:400;">/mo</span></div>
+      <div class="tier-desc">~1,000 pages</div>
+    </div>
+  </div>
+</div>
+
+<footer>ADA PDF Remediation · Built for government agencies, law firms, hospitals &amp; universities</footer>
+
+<script>
+  let currentUploadId = null;
+  let currentJobId = null;
+  let pollTimer = null;
+
+  // --- Drag and drop ---
+  const dropZone = document.getElementById('drop-zone');
+  dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('dragover'); });
+  dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+  dropZone.addEventListener('drop', e => {
+    e.preventDefault();
+    dropZone.classList.remove('dragover');
+    const file = e.dataTransfer.files[0];
+    if (file) handleFile(file);
+  });
+  document.getElementById('file-input').addEventListener('change', e => {
+    if (e.target.files[0]) handleFile(e.target.files[0]);
+  });
+
+  async function handleFile(file) {
+    if (!file.name.toLowerCase().endsWith('.pdf')) {
+      showError('Only PDF files are accepted.');
+      return;
+    }
+
+    dropZone.innerHTML = `<p style="color:#3182ce;font-weight:600;">⏳ Uploading ${file.name}…</p>`;
+
+    const formData = new FormData();
+    formData.append('file', file);
+
+    try {
+      const res = await fetch('/api/upload', { method: 'POST', body: formData });
+      const data = await res.json();
+
+      if (!res.ok) { showError(data.detail || 'Upload failed'); return; }
+
+      currentUploadId = data.upload_id;
+
+      // Update stats
+      document.getElementById('stat-pages').textContent = data.page_count;
+      const billing = data.billing;
+      if (billing.requires_payment) {
+        document.getElementById('stat-cost').innerHTML =
+          `$${billing.amount_usd.toFixed(2)}<span style="font-size:0.8rem;font-weight:400;"> (${billing.billable_pages} pages × $0.05)</span>`;
+      } else {
+        document.getElementById('stat-cost').innerHTML =
+          `FREE <span class="free-badge">✓ within free tier</span>`;
+      }
+
+      if (data.requires_confirmation) {
+        const w = document.getElementById('large-doc-warning');
+        w.textContent = `⚠ Large document (${data.page_count} pages). Processing may take several minutes.`;
+        w.style.display = 'block';
+      }
+
+      dropZone.style.display = 'none';
+      document.getElementById('estimate-panel').style.display = 'block';
+
+    } catch (err) {
+      showError('Network error. Please try again.');
+      resetDropZone();
+    }
+  }
+
+  async function startProcessing() {
+    if (!currentUploadId) return;
+    document.getElementById('btn-process').disabled = true;
+
+    const res = await fetch('/api/process', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ upload_id: currentUploadId, use_claude: false, confirmed: true }),
+    });
+    const data = await res.json();
+
+    if (!res.ok) { showError(data.detail || 'Failed to start processing'); return; }
+
+    // Stripe redirect
+    if (data.checkout_url) {
+      window.location.href = data.checkout_url;
+      return;
+    }
+
+    currentJobId = data.job_id;
+
+    // Show progress
+    document.querySelector('.card:first-of-type').style.display = 'none';
+    document.getElementById('progress-panel').style.display = 'block';
+    pollStatus();
+  }
+
+  function pollStatus() {
+    if (!currentJobId) return;
+    pollTimer = setInterval(async () => {
+      try {
+        const res = await fetch(`/api/status/${currentJobId}`);
+        const data = await res.json();
+
+        // Update progress bar
+        document.getElementById('progress-fill').style.width = data.progress + '%';
+        if (data.total_pages > 0) {
+          document.getElementById('progress-label').textContent =
+            `Analyzing page ${data.current_page} of ${data.total_pages}…`;
+        }
+
+        if (data.status === 'done') {
+          clearInterval(pollTimer);
+          showResult(data);
+        } else if (data.status === 'failed') {
+          clearInterval(pollTimer);
+          showError('Processing failed: ' + (data.error || 'Unknown error'));
+          document.getElementById('progress-panel').style.display = 'none';
+          document.querySelector('.card:first-of-type').style.display = 'block';
+        }
+      } catch (e) { /* retry next tick */ }
+    }, 2000);
+  }
+
+  function showResult(data) {
+    document.getElementById('progress-panel').style.display = 'none';
+    document.getElementById('result-panel').style.display = 'block';
+
+    if (data.check_report) renderReport(data.check_report);
+  }
+
+  function renderReport(report) {
+    if (report.error) return;
+
+    const panel = document.getElementById('report-panel');
+    const list = document.getElementById('issue-list');
+    list.innerHTML = '';
+
+    (report.issues || []).forEach(issue => {
+      const li = document.createElement('li');
+      li.textContent = issue.message;
+      li.className = `issue-${issue.severity}`;
+      list.appendChild(li);
+    });
+
+    const summary = document.getElementById('report-summary');
+    if (report.failed === 0) {
+      summary.textContent = `✓ All structure checks passed`;
+      summary.className = 'report-summary report-pass';
+    } else {
+      summary.textContent = `${report.failed} issue(s) found — fix before publishing`;
+      summary.className = 'report-summary report-fail';
+    }
+
+    panel.style.display = 'block';
+  }
+
+  async function downloadResult() {
+    if (!currentJobId) return;
+    window.location.href = `/api/download/${currentJobId}`;
+  }
+
+  function showError(msg) {
+    const box = document.getElementById('error-box');
+    box.textContent = msg;
+    box.style.display = 'block';
+    document.getElementById('estimate-panel').style.display = 'block';
+    dropZone.style.display = 'none';
+  }
+
+  function resetDropZone() {
+    dropZone.innerHTML = `
+      <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+          d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414A1 1 0 0119 9.414V19a2 2 0 01-2 2z"/>
+      </svg>
+      <p><strong>Click to upload</strong> or drag &amp; drop a PDF</p>
+      <p style="font-size:0.8rem;margin-top:0.4rem;">Max 50 MB · PDF only</p>`;
+    dropZone.style.display = 'block';
+  }
+
+  function resetUpload() {
+    clearInterval(pollTimer);
+    currentUploadId = null;
+    currentJobId = null;
+    document.getElementById('estimate-panel').style.display = 'none';
+    document.getElementById('progress-panel').style.display = 'none';
+    document.getElementById('result-panel').style.display = 'none';
+    document.getElementById('report-panel').style.display = 'none';
+    document.getElementById('error-box').style.display = 'none';
+    document.getElementById('large-doc-warning').style.display = 'none';
+    document.getElementById('file-input').value = '';
+    resetDropZone();
+    document.querySelector('.card:first-of-type').style.display = 'block';
+  }
+
+  // Auto-resume job if redirected back from Stripe
+  const params = new URLSearchParams(window.location.search);
+  const resumeJobId = params.get('job_id');
+  if (resumeJobId) {
+    currentJobId = resumeJobId;
+    document.querySelector('.card:first-of-type').style.display = 'none';
+    document.getElementById('progress-panel').style.display = 'block';
+    pollStatus();
+  }
+</script>
+</body>
+</html>

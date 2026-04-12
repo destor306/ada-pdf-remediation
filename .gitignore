@@ -1,0 +1,29 @@
+# Environment
+.env
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Uploads / outputs (user data — never commit)
+uploads/
+outputs/
+logs/
+
+# Test artifacts
+test_output.docx
+*.docx
+test_fldoe.pdf
+
+# IDE
+.vscode/
+.idea/
+*.swp
