@@ -57,7 +57,7 @@ OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 
 def detect_backends() -> dict:
     """Check which backends are available."""
-    backends = {"ollama": False, "claude": False}
+    backends = {"ollama": False, "claude": False, "mock": False}
 
     # Check Ollama
     try:
@@ -76,6 +76,11 @@ def detect_backends() -> dict:
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if api_key and os.environ.get("NO_FALLBACK") != "1":
         backends["claude"] = True
+
+    # Mock mode — always available as last resort (text extraction, no AI)
+    # Enabled automatically when no real backend found, or via MOCK_MODE=1
+    if os.environ.get("MOCK_MODE") == "1" or (not backends["ollama"] and not backends["claude"]):
+        backends["mock"] = True
 
     return backends
 
@@ -280,6 +285,57 @@ def analyze_with_claude(pdf_path: str, page_num: int, text_hint: str = "") -> di
 
 
 # ---------------------------------------------------------------------------
+# Mock backend (no AI — uses pdfplumber text extraction)
+# ---------------------------------------------------------------------------
+
+def analyze_with_mock(pdf_path: str, page_num: int, text_hint: str = "") -> dict:
+    """
+    No-AI fallback: converts raw pdfplumber text into structured elements.
+    Good enough to test the full pipeline and UI without any API keys or Ollama.
+    Output quality: readable text, basic heading detection, no table structure.
+    """
+    import pdfplumber
+
+    elements = []
+    with pdfplumber.open(pdf_path) as pdf:
+        page = pdf.pages[page_num - 1]
+
+        # Try to extract table data
+        tables = page.extract_tables()
+        text_outside_tables = page.extract_text() or ""
+
+        # Detect title/heading lines (short lines at top, or ALL CAPS lines)
+        lines = [l.strip() for l in text_outside_tables.splitlines() if l.strip()]
+        used_as_heading = set()
+
+        for i, line in enumerate(lines[:5]):  # first 5 lines — likely headings
+            if len(line) < 80 and (line.isupper() or i == 0):
+                level = 1 if i == 0 else 2
+                elements.append({"type": "heading", "level": level, "text": line})
+                used_as_heading.add(line)
+
+        # Add tables
+        for table in tables:
+            if not table:
+                continue
+            rows = []
+            for r_idx, row in enumerate(table):
+                cells = [str(c or "").strip() for c in row]
+                if any(cells):
+                    rows.append({"is_header": r_idx == 0, "cells": cells})
+            if rows:
+                elements.append({"type": "table", "rows": rows})
+
+        # Remaining lines as paragraphs
+        for line in lines:
+            if line not in used_as_heading and len(line) > 2:
+                # Skip lines that are likely already captured in tables
+                elements.append({"type": "paragraph", "text": line})
+
+    return {"page": page_num, "elements": elements}
+
+
+# ---------------------------------------------------------------------------
 # Page analysis dispatcher
 # ---------------------------------------------------------------------------
 
@@ -289,7 +345,7 @@ def analyze_page(
     text_hint: str,
     backends: dict,
 ) -> dict:
-    """Try local first, fall back to Claude if needed and available."""
+    """Try local first, fall back to Claude, then mock (text-only) as last resort."""
     if backends["ollama"]:
         result = analyze_with_ollama(pdf_path, page_num, text_hint)
         if result is not None:
@@ -298,6 +354,9 @@ def analyze_page(
     if backends["claude"]:
         print(f"    → Using Claude API fallback for page {page_num}")
         return analyze_with_claude(pdf_path, page_num, text_hint)
+
+    if backends.get("mock"):
+        return analyze_with_mock(pdf_path, page_num, text_hint)
 
     print(f"  [error] No backend available for page {page_num}. Returning empty.")
     return {"page": page_num, "elements": []}
@@ -471,10 +530,9 @@ def main():
     print(f"  Claude API:             {'available' if backends['claude'] else 'not available'}")
 
     if not backends["ollama"] and not backends["claude"]:
-        print("\nError: no AI backend available.")
-        print(f"  Option A: Install Ollama + pull {LOCAL_MODEL}")
-        print("  Option B: Set ANTHROPIC_API_KEY for Claude fallback")
-        sys.exit(1)
+        print(f"\n  [info] No AI backend found — running in mock mode (text extraction only).")
+        print(f"         Output will be readable but table structure won't be reconstructed.")
+        print(f"         To enable AI: install Ollama + pull {LOCAL_MODEL}, or set ANTHROPIC_API_KEY")
 
     cost, cost_note = estimate_cost(pages_to_process, backends)
     print(f"\nCost estimate: {cost_note}")

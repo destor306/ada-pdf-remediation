@@ -218,6 +218,18 @@
     <div id="large-doc-warning" class="warning-box" style="display:none;"></div>
     <div id="error-box" class="alert alert-error" style="display:none;"></div>
 
+    <div style="margin-top:1rem;">
+      <label style="font-size:.85rem;color:#4a5568;font-weight:500;">
+        Email (optional — get notified when done)
+      </label>
+      <input type="email" id="notify-email" placeholder="you@example.com"
+        style="display:block;width:100%;margin-top:.3rem;padding:.5rem .75rem;
+               border:1.5px solid #e2e8f0;border-radius:8px;font-size:.9rem;
+               outline:none;transition:border .15s"
+        onfocus="this.style.borderColor='#3182ce'"
+        onblur="this.style.borderColor='#e2e8f0'" />
+    </div>
+
     <div class="btn-row">
       <button class="btn btn-primary" id="btn-process" onclick="startProcessing()">
         ✦ Remediate PDF
@@ -234,8 +246,8 @@
   <div class="progress-bar-bg">
     <div class="progress-bar-fill" id="progress-fill"></div>
   </div>
-  <p style="font-size:0.8rem;color:#a0aec0;margin-top:0.5rem;">
-    Using local AI model (free). This may take 1–3 minutes.
+  <p style="font-size:0.8rem;color:#a0aec0;margin-top:0.5rem;" id="processing-note">
+    Preparing…
   </p>
 </div>
 
@@ -244,22 +256,19 @@
   <div class="success-icon">✅</div>
   <h2>Remediation Complete</h2>
 
-  <div class="btn-row" style="justify-content:center;">
-    <button class="btn btn-success" id="btn-download" onclick="downloadResult()">
-      ⬇ Download Accessible .docx
+  <div class="btn-row" style="justify-content:center;" id="download-buttons">
+    <button class="btn btn-success" id="btn-download-pdf" onclick="downloadResult('pdf')" style="display:none">
+      ⬇ Download ADA-Compliant PDF
+    </button>
+    <button class="btn btn-outline" id="btn-download-docx" onclick="downloadResult('docx')" style="display:none">
+      ⬇ Download .docx (editable)
     </button>
     <button class="btn btn-outline" onclick="resetUpload()">Process another PDF</button>
   </div>
 
-  <div style="margin-top:1.5rem;padding:1rem;background:#f7fafc;border-radius:8px;font-size:0.85rem;color:#4a5568;">
-    <strong>Next steps:</strong>
-    <ol style="margin-top:0.5rem;padding-left:1.2rem;line-height:1.8;">
-      <li>Open the .docx in <strong>Microsoft Word</strong></li>
-      <li>Run <strong>Review → Check Accessibility</strong> and fix any remaining issues</li>
-      <li>Export: <strong>File → Save As → PDF</strong><br>
-          ✓ Check <em>"Document structure tags for accessibility"</em></li>
-      <li>Validate with <a href="https://pac.pdf-accessibility.org" target="_blank" style="color:#3182ce;">PAC 2026</a></li>
-    </ol>
+  <div id="validate-note" style="display:none;margin-top:1.5rem;padding:1rem;background:#f7fafc;border-radius:8px;font-size:.85rem;color:#4a5568;">
+    Validate with <a href="https://pac.pdf-accessibility.org" target="_blank" style="color:#3182ce;">PAC 2026</a>
+    to confirm full PDF/UA compliance.
   </div>
 </div>
 
@@ -403,6 +412,9 @@
           document.getElementById('progress-label').textContent =
             `Analyzing page ${data.current_page} of ${data.total_pages}…`;
         }
+        if (data.backend_label) {
+          document.getElementById('processing-note').textContent = `Backend: ${data.backend_label}`;
+        }
 
         if (data.status === 'done') {
           clearInterval(pollTimer);
@@ -420,6 +432,15 @@
   function showResult(data) {
     document.getElementById('progress-panel').style.display = 'none';
     document.getElementById('result-panel').style.display = 'block';
+
+    // Show appropriate download buttons
+    if (data.has_pdf) {
+      document.getElementById('btn-download-pdf').style.display = 'inline-flex';
+      document.getElementById('validate-note').style.display = 'block';
+    }
+    if (data.has_docx) {
+      document.getElementById('btn-download-docx').style.display = 'inline-flex';
+    }
 
     if (data.check_report) renderReport(data.check_report);
   }
@@ -450,9 +471,9 @@
     panel.style.display = 'block';
   }
 
-  async function downloadResult() {
+  async function downloadResult(fmt = 'pdf') {
     if (!currentJobId) return;
-    window.location.href = `/api/download/${currentJobId}`;
+    window.location.href = `/api/download/${currentJobId}?fmt=${fmt}`;
   }
 
   function showError(msg) {

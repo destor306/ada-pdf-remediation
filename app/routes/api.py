@@ -97,7 +97,8 @@ async def process_pdf(body: dict):
     if not pdf_path.exists():
         raise HTTPException(404, "Upload not found or expired")
 
-    use_claude = body.get("use_claude", False)
+    use_claude   = body.get("use_claude", False)
+    notify_email = body.get("email", "").strip()
 
     # Count pages for billing
     import pdfplumber
@@ -106,7 +107,7 @@ async def process_pdf(body: dict):
 
     # Create job record
     output_path = str(OUTPUT_DIR / f"{upload_id}_accessible.docx")
-    job = create_job(str(pdf_path), output_path, use_claude=use_claude)
+    job = create_job(str(pdf_path), output_path, use_claude=use_claude, notify_email=notify_email)
 
     billing = calculate_charge(page_count)
 
@@ -137,6 +138,12 @@ async def job_status(job_id: str):
     if not job:
         raise HTTPException(404, "Job not found")
 
+    backend_labels = {
+        "ollama": "Local AI (Ollama)",
+        "claude": "Claude API",
+        "mock": "Text extraction (no AI — install Ollama for better results)",
+        "unknown": "Detecting…",
+    }
     return {
         "job_id": job.id,
         "status": job.status,
@@ -146,20 +153,38 @@ async def job_status(job_id: str):
         "error": job.error,
         "check_report": job.check_report if job.status == "done" else None,
         "completed_at": job.completed_at,
+        "backend": job.backend,
+        "backend_label": backend_labels.get(job.backend, job.backend),
+        "has_pdf": bool(getattr(job, "output_pdf", None) and Path(job.output_pdf).exists()) if job.status == "done" else False,
+        "has_docx": Path(job.output_path).exists() if job.status == "done" else False,
     }
 
 
 @router.get("/download/{job_id}")
-async def download_result(job_id: str):
-    """Download the completed .docx file."""
+async def download_result(job_id: str, fmt: str = "pdf"):
+    """
+    Download completed output.
+    fmt=pdf  → ADA-compliant PDF (default)
+    fmt=docx → Word document (intermediate)
+    """
     job = get_job(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
     if job.status != "done":
         raise HTTPException(400, f"Job not complete (status: {job.status})")
+
+    # Prefer PDF output
+    if fmt != "docx" and getattr(job, "output_pdf", None) and Path(job.output_pdf).exists():
+        filename = Path(job.pdf_path).stem + "_ada_compliant.pdf"
+        return FileResponse(
+            path=job.output_pdf,
+            media_type="application/pdf",
+            filename=filename,
+        )
+
+    # Fall back to docx
     if not Path(job.output_path).exists():
         raise HTTPException(500, "Output file missing")
-
     filename = Path(job.output_path).name
     return FileResponse(
         path=job.output_path,
