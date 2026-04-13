@@ -16,12 +16,20 @@ from app.config import (
 )
 from app.jobs import create_job, get_job, start_job
 from app.billing import calculate_charge, create_checkout_session
+from app.ratelimit import check_free_tier, consume_free_pages, get_usage
 
 router = APIRouter(prefix="/api")
 
 
+@router.get("/usage")
+async def usage_route(request: Request):
+    """Return free-tier usage for the current IP."""
+    ip = request.client.host if request.client else "unknown"
+    return get_usage(ip)
+
+
 @router.post("/upload")
-async def upload_pdf(file: UploadFile = File(...)):
+async def upload_pdf(request: Request, file: UploadFile = File(...)):
     """
     Accept a PDF upload, return page count and cost estimate.
     Does NOT start processing yet.
@@ -55,6 +63,8 @@ async def upload_pdf(file: UploadFile = File(...)):
 
     billing = calculate_charge(page_count)
     requires_confirmation = page_count > LARGE_DOC_THRESHOLD
+    ip = request.client.host if request.client else "unknown"
+    usage = get_usage(ip)
 
     return {
         "upload_id": upload_id,
@@ -66,6 +76,7 @@ async def upload_pdf(file: UploadFile = File(...)):
             f"This document has {page_count} pages."
             if requires_confirmation else None
         ),
+        "free_tier_usage": usage,
     }
 
 

@@ -8,6 +8,7 @@ from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 
 from app.billing import init_stripe
+from app.storage import start_cleanup_thread
 from app.routes.api import router as api_router
 from app.routes.billing import router as billing_router
 from app.routes.pages import router as pages_router
@@ -17,6 +18,7 @@ from app.routes.admin import router as admin_router
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_stripe()
+    start_cleanup_thread()
     print("ADA Remediation API started.")
     print("  Docs: http://localhost:8000/docs")
     yield
