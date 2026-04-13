@@ -15,10 +15,11 @@ templates = Jinja2Templates(directory=str(Path(__file__).parent.parent / "templa
 
 @router.get("/", response_class=HTMLResponse)
 async def index(request: Request, job_id: str = "", paid: str = "", cancelled: str = ""):
-    return templates.TemplateResponse("index.html", {
+    context = {
         "request": request,
         "stripe_pk": STRIPE_PUBLISHABLE_KEY,
         "job_id": job_id,
         "paid": paid,
         "cancelled": cancelled,
-    })
+    }
+    return templates.TemplateResponse(request, "index.html", context)
