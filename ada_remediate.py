@@ -25,6 +25,12 @@ import re
 import io
 from pathlib import Path
 
+import sys
+sys.stdout.reconfigure(encoding='utf-8')
+
+from dotenv import load_dotenv
+load_dotenv()
+
 import pdfplumber
 from pdf2image import convert_from_path
 from docx import Document
@@ -49,6 +55,16 @@ LOCAL_COST_PER_PAGE = 0.0        # free
 LOCAL_MODEL = os.environ.get("LOCAL_MODEL", "qwen2-vl")
 CLAUDE_MODEL = "claude-sonnet-4-5"
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+
+# Poppler path (Windows — set via env or auto-detected)
+_WINGET_POPPLER = os.path.expandvars(
+    r"%LOCALAPPDATA%\Microsoft\WinGet\Packages\oschwartz10612.Poppler_Microsoft.Winget.Source_8wekyb3d8bbwe"
+)
+_poppler_candidates = [
+    os.environ.get("POPPLER_PATH", ""),
+    next((str(p) for p in Path(_WINGET_POPPLER).glob("poppler-*/Library/bin") if p.is_dir()), "") if os.path.isdir(_WINGET_POPPLER) else "",
+]
+POPPLER_PATH = next((p for p in _poppler_candidates if p and os.path.isdir(p)), None)
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +139,7 @@ def render_page_to_base64(pdf_path: str, page_number: int) -> str:
         pdf_path, dpi=DPI,
         first_page=page_number, last_page=page_number,
         fmt="png",
+        poppler_path=POPPLER_PATH,
     )
     if not images:
         raise ValueError(f"Could not render page {page_number}")
@@ -225,24 +242,40 @@ def parse_json_response(raw: str, page_num: int) -> dict:
 # ---------------------------------------------------------------------------
 
 def analyze_with_ollama(pdf_path: str, page_num: int, text_hint: str = "") -> dict | None:
-    """Try local vision model. Returns None on failure."""
+    """Try local vision model. Returns None on failure.
+
+    llava-family models do not support the 'system' role — they silently return
+    empty when a system message is present.  Workaround: fold the system prompt
+    into the user message so the full instruction arrives in one turn.
+    """
     try:
         import ollama
         image_b64 = render_page_to_base64(pdf_path, page_num)
         client = ollama.Client(host=OLLAMA_HOST)
+
+        # Combine system instructions + user request into a single user message
+        combined = (
+            f"{SYSTEM_PROMPT}\n\n"
+            f"---\n"
+            f"{user_message_text(page_num, text_hint)}"
+        )
+
         response = client.chat(
             model=LOCAL_MODEL,
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
                 {
                     "role": "user",
-                    "content": user_message_text(page_num, text_hint),
+                    "content": combined,
                     "images": [image_b64],
                 },
             ],
+            format="json",
             options={"temperature": 0},
         )
         raw = response.message.content or ""
+        if not raw.strip():
+            print(f"  [warn] Local model returned empty response for page {page_num}, trying fallback.")
+            return None
         result = parse_json_response(raw, page_num)
         # Basic quality check: did we get any elements?
         if result.get("elements"):
@@ -566,12 +599,22 @@ def main():
     print(f"\nBuilding accessible .docx → {output_path}")
     build_docx(pages_data, output_path, page_dims=page_dims)
 
-    print(f"\nDone! Next steps:")
-    print(f"  1. Open '{output_path}' in Microsoft Word")
-    print(f"  2. Run Accessibility Checker: Review → Check Accessibility")
-    print(f"  3. Export PDF: File → Save As → PDF")
-    print(f"       ✓ Check 'Document structure tags for accessibility'")
-    print(f"  4. Validate with PAC 2026: https://pac.pdf-accessibility.org")
+    # --- Step 7: Export accessible PDF via Word COM ---
+    pdf_output_path = str(Path(output_path).with_suffix(".pdf"))
+    print(f"\nExporting accessible PDF → {pdf_output_path}")
+    try:
+        from docx2pdf import convert
+        convert(output_path, pdf_output_path)
+        print(f"  ✅ PDF exported successfully.")
+    except Exception as e:
+        print(f"  ⚠️  PDF export failed: {e}")
+        print(f"     Open '{output_path}' in Word → File → Save As → PDF")
+        print(f"     ✓ Check 'Document structure tags for accessibility'")
+
+    print(f"\nDone!")
+    print(f"  Word file: {output_path}")
+    print(f"  PDF file:  {pdf_output_path}")
+    print(f"\nValidate with PAC 2026: https://pac.pdf-accessibility.org")
 
 
 if __name__ == "__main__":
