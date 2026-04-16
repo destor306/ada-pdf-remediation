@@ -649,8 +649,21 @@ def _match_blocks_to_elements(blocks: list[dict], elements: list[dict]) -> dict[
     return assignments
 
 
+def _strip_marked_content(instructions) -> list:
+    """Remove any existing BDC/BMC/EMC markers from a content stream.
+
+    Strips pre-existing marks so we never produce duplicate MCID values on
+    the same page when we inject our own markers.
+    """
+    return [i for i in instructions if str(i.operator) not in ('BDC', 'BMC', 'EMC')]
+
+
 def _inject_mcids(instructions, blocks: list[dict], assignments: dict[int, tuple[str, int]]) -> list:
-    """Return a new instruction list with BDC/EMC markers injected around assigned blocks."""
+    """Return a new instruction list with BDC/EMC markers injected around assigned blocks.
+
+    `instructions` must already be stripped of existing BDC/BMC/EMC markers,
+    and `blocks` must have been derived from those same stripped instructions.
+    """
     from pikepdf import ContentStreamInstruction, Operator, Name, Dictionary, Integer as PikInt
 
     block_starts = {b['start']: (i, b) for i, b in enumerate(blocks) if i in assignments}
@@ -681,6 +694,10 @@ def tag_pdf_with_accessibility(
     Create an accessible PDF by tagging the ORIGINAL document in-place.
     Visual appearance (fonts, images, tables, layout) is preserved exactly.
     Adds: MarkInfo, Lang, document title, and a full StructTreeRoot with MCIDs.
+
+    MCIDs are page-local (reset to 0 on each page) per the PDF spec.
+    The ParentTree maps each page's StructParents index to an array of parent
+    struct elements — one entry per MCID — as required by PDF/UA validators.
     """
     from pikepdf import Dictionary, Array, Name, String, Integer as PikInt
 
@@ -697,9 +714,13 @@ def tag_pdf_with_accessibility(
         if '/StructTreeRoot' in pdf.Root:
             del pdf.Root['/StructTreeRoot']
 
-        all_struct_elems = []
-        parent_tree_nums = []
-        global_mcid = 0
+        # Clear any existing StructParents from all pages
+        for pg in pdf.pages:
+            if '/StructParents' in pg:
+                del pg['/StructParents']
+
+        all_struct_elems = []   # flattened list for the Document StructElem
+        page_parent_arrays = [] # one Array per tagged page for the ParentTree
 
         for page_idx, page_data in enumerate(pages_data):
             if page_idx >= len(pdf.pages):
@@ -709,23 +730,30 @@ def tag_pdf_with_accessibility(
             if not elements:
                 continue
 
-            # Parse content stream
+            # Parse and strip existing marked-content operators so we start clean
             try:
                 raw_stream = pikepdf.parse_content_stream(page_obj)
-                blocks = _find_content_blocks(raw_stream)
+                clean_stream = _strip_marked_content(raw_stream)
+                blocks = _find_content_blocks(clean_stream)
                 assignments = _match_blocks_to_elements(blocks, elements)
+                # assignments: {block_idx: (tag_name, local_mcid)}
+                # local_mcid values are 0-based and page-local
             except Exception as e:
                 print(f"  [warn] Stream parse failed p{page_idx + 1}: {e}")
-                blocks, assignments = [], {}
+                continue
 
-            # Build struct elements for matched blocks
-            local_mcid_to_struct = {}
+            if not assignments:
+                continue
+
+            # Build struct elements; keep a slot-indexed array for the ParentTree
+            max_local_mcid = max(lm for _, lm in assignments.values())
+            parent_slot: list = [None] * (max_local_mcid + 1)
+
             for block_idx, (tag_name, local_mcid) in assignments.items():
-                page_mcid = global_mcid + local_mcid
                 mcr = pdf.make_indirect(Dictionary(
                     Type=Name('/MCR'),
-                    Pg=page_obj.obj,
-                    MCID=PikInt(page_mcid),
+                    Pg=page_obj.obj,      # indirect ref to this page
+                    MCID=PikInt(local_mcid),
                 ))
                 struct_d = Dictionary(
                     Type=Name('/StructElem'),
@@ -733,7 +761,6 @@ def tag_pdf_with_accessibility(
                     Pg=page_obj.obj,
                     K=Array([mcr]),
                 )
-                # Add Alt text for figures
                 if tag_name == 'Figure':
                     for elem in elements:
                         if elem.get('type') == 'image_alt':
@@ -742,51 +769,24 @@ def tag_pdf_with_accessibility(
                                 struct_d['/Alt'] = String(alt)
                             break
                 struct_ref = pdf.make_indirect(struct_d)
-                local_mcid_to_struct[page_mcid] = struct_ref
+                parent_slot[local_mcid] = struct_ref
                 all_struct_elems.append(struct_ref)
 
-            # Add unmatched table/figure elements (important for accessibility)
-            for elem in elements:
-                etype = elem.get('type')
-                if etype == 'table':
-                    rows = elem.get('rows', [])
-                    alt = ''
-                    if rows:
-                        cells = rows[0].get('cells', [])
-                        alt = 'Table: ' + ', '.join(str(c) for c in cells[:6])
-                    struct_d = Dictionary(
-                        Type=Name('/StructElem'), S=Name('/Table'), Pg=page_obj.obj,
-                    )
-                    if alt:
-                        struct_d['/Alt'] = String(alt[:500])
-                    all_struct_elems.append(pdf.make_indirect(struct_d))
-                elif etype == 'image_alt':
-                    text = elem.get('text', '')[:500]
-                    struct_d = Dictionary(
-                        Type=Name('/StructElem'), S=Name('/Figure'), Pg=page_obj.obj,
-                    )
-                    if text:
-                        struct_d['/Alt'] = String(text)
-                    all_struct_elems.append(pdf.make_indirect(struct_d))
+            # Inject page-local MCIDs into the (already-stripped) content stream
+            try:
+                new_stream = _inject_mcids(clean_stream, blocks, assignments)
+                page_obj['/Contents'] = pdf.make_stream(
+                    pikepdf.unparse_content_stream(new_stream)
+                )
+            except Exception as e:
+                print(f"  [warn] MCID injection failed p{page_idx + 1}: {e}")
+                continue
 
-            # Inject MCIDs into content stream
-            if assignments and blocks:
-                try:
-                    global_assignments = {
-                        bi: (tag, global_mcid + lm)
-                        for bi, (tag, lm) in assignments.items()
-                    }
-                    new_stream = _inject_mcids(raw_stream, blocks, global_assignments)
-                    page_obj['/Contents'] = pdf.make_stream(
-                        pikepdf.unparse_content_stream(new_stream)
-                    )
-                    for page_mcid, struct_ref in local_mcid_to_struct.items():
-                        parent_tree_nums += [PikInt(page_mcid), struct_ref]
-                except Exception as e:
-                    print(f"  [warn] MCID injection failed p{page_idx + 1}: {e}")
-
-            if assignments:
-                global_mcid += max(lm for _, lm in assignments.values()) + 1
+            # Wire up StructParents: page points to its index in the ParentTree
+            tree_idx = len(page_parent_arrays)
+            page_obj['/StructParents'] = PikInt(tree_idx)
+            # parent_slot is contiguous (MCIDs are 0..N-1) so no None gaps expected
+            page_parent_arrays.append(Array(parent_slot))
 
         if not all_struct_elems:
             pdf.save(output_path)
@@ -800,12 +800,18 @@ def tag_pdf_with_accessibility(
         for ref in all_struct_elems:
             ref['/P'] = doc_elem
 
-        parent_tree = pdf.make_indirect(Dictionary(Nums=Array(parent_tree_nums)))
+        # ParentTree Nums: [0, array_for_page0, 1, array_for_page1, ...]
+        # Each array maps MCID index → parent StructElem for that page
+        nums: list = []
+        for idx, arr in enumerate(page_parent_arrays):
+            nums.extend([PikInt(idx), pdf.make_indirect(arr)])
+
+        parent_tree = pdf.make_indirect(Dictionary(Nums=Array(nums)))
         struct_root = pdf.make_indirect(Dictionary(
             Type=Name('/StructTreeRoot'),
             K=Array([doc_elem]),
             ParentTree=parent_tree,
-            ParentTreeNextKey=PikInt(global_mcid),
+            ParentTreeNextKey=PikInt(len(page_parent_arrays)),
         ))
         doc_elem['/P'] = struct_root
         pdf.Root['/StructTreeRoot'] = struct_root
