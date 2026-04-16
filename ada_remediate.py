@@ -725,6 +725,75 @@ def _inject_mcids(instructions, blocks: list[dict], assignments: dict[int, tuple
     return new_instrs
 
 
+def _build_outlines(pdf, pages_data: list[dict]) -> None:
+    """Add a hierarchical bookmark outline built from heading elements.
+
+    PDF/UA requires a document outline when the document has sections.
+    Headings are collected across all pages and nested by level.
+    """
+    from pikepdf import Dictionary, Array, Name, String, Integer as PikInt
+
+    # Collect headings in document order
+    headings = []
+    for page_idx, page_data in enumerate(pages_data):
+        if page_idx >= len(pdf.pages):
+            break
+        for elem in page_data.get('elements', []):
+            if elem.get('type') == 'heading':
+                level = max(1, min(6, elem.get('level', 1)))
+                text  = elem.get('text', '').strip()
+                if text:
+                    headings.append((page_idx, level, text))
+
+    if not headings:
+        return
+
+    outline_root = pdf.make_indirect(Dictionary(Type=Name('/Outlines')))
+
+    # Build item dicts (level, item ref, children list)
+    # /Fit destination scrolls to the top of the page
+    entries = []
+    for page_idx, level, text in headings:
+        dest = Array([pdf.pages[page_idx].obj, Name('/Fit')])
+        item = pdf.make_indirect(Dictionary(Title=String(text), Dest=dest))
+        entries.append({'level': level, 'item': item, 'children': []})
+
+    # Nest entries by level using a stack
+    root_entry = {'level': 0, 'item': outline_root, 'children': []}
+    stack = [root_entry]
+    for entry in entries:
+        while len(stack) > 1 and stack[-1]['level'] >= entry['level']:
+            stack.pop()
+        stack[-1]['children'].append(entry)
+        stack.append(entry)
+
+    # Wire up Parent / Prev / Next / First / Last / Count links
+    def _link(parent_entry: dict) -> int:
+        children = parent_entry['children']
+        if not children:
+            return 0
+        parent_ref = parent_entry['item']
+        parent_ref['/First'] = children[0]['item']
+        parent_ref['/Last']  = children[-1]['item']
+        total = len(children)
+        for i, child in enumerate(children):
+            child['item']['/Parent'] = parent_ref
+            if i > 0:
+                child['item']['/Prev'] = children[i - 1]['item']
+            if i < len(children) - 1:
+                child['item']['/Next'] = children[i + 1]['item']
+            total += _link(child)
+        # Positive count = subtree open; root always positive
+        count = total if parent_entry['level'] == 0 else len(children)
+        parent_ref['/Count'] = PikInt(count)
+        return len(children)
+
+    _link(root_entry)
+
+    pdf.Root['/Outlines']  = outline_root
+    pdf.Root['/PageMode']  = Name('/UseOutlines')
+
+
 def tag_pdf_with_accessibility(
     source_pdf: str,
     pages_data: list[dict],
@@ -771,57 +840,30 @@ def tag_pdf_with_accessibility(
         all_struct_elems = []   # flattened list for the Document StructElem
         page_parent_arrays = [] # one Array per tagged page for the ParentTree
 
+        # Table and L are grouping elements — they cannot directly contain MCRs.
+        # Remap them to safe leaf types to avoid "Content in inadmissible location".
+        GROUPING_REMAP = {'Table': 'Caption', 'L': 'P'}
+
         for page_idx, page_data in enumerate(pages_data):
             if page_idx >= len(pdf.pages):
                 break
             page_obj = pdf.pages[page_idx]
             elements = page_data.get('elements', [])
-            if not elements:
-                continue
 
-            # Parse and strip existing marked-content operators so we start clean
+            # Parse and strip existing marked-content operators so we start clean.
+            # We ALWAYS rewrite the content stream — even for pages with no matched
+            # content — so original BDC/MCID markers don't become dangling refs
+            # after we clear the StructTreeRoot.
             try:
                 raw_stream = pikepdf.parse_content_stream(page_obj)
                 clean_stream = _strip_marked_content(raw_stream)
                 blocks = _find_content_blocks(clean_stream)
-                assignments = _match_blocks_to_elements(blocks, elements)
-                # assignments: {block_idx: (tag_name, local_mcid)}
-                # local_mcid values are 0-based and page-local
+                assignments = _match_blocks_to_elements(blocks, elements) if elements else {}
             except Exception as e:
                 print(f"  [warn] Stream parse failed p{page_idx + 1}: {e}")
                 continue
 
-            if not assignments:
-                continue
-
-            # Build struct elements; keep a slot-indexed array for the ParentTree
-            max_local_mcid = max(lm for _, lm in assignments.values())
-            parent_slot: list = [None] * (max_local_mcid + 1)
-
-            for block_idx, (tag_name, local_mcid) in assignments.items():
-                mcr = pdf.make_indirect(Dictionary(
-                    Type=Name('/MCR'),
-                    Pg=page_obj.obj,      # indirect ref to this page
-                    MCID=PikInt(local_mcid),
-                ))
-                struct_d = Dictionary(
-                    Type=Name('/StructElem'),
-                    S=Name(f'/{tag_name}'),
-                    Pg=page_obj.obj,
-                    K=Array([mcr]),
-                )
-                if tag_name == 'Figure':
-                    alt = ''
-                    for elem in elements:
-                        if elem.get('type') == 'image_alt':
-                            alt = elem.get('text', '')[:500]
-                            break
-                    struct_d['/Alt'] = String(alt or 'Figure')
-                struct_ref = pdf.make_indirect(struct_d)
-                parent_slot[local_mcid] = struct_ref
-                all_struct_elems.append(struct_ref)
-
-            # Inject page-local MCIDs into the (already-stripped) content stream
+            # Always write back (with artifacts for everything if no assignments)
             try:
                 new_stream = _inject_mcids(clean_stream, blocks, assignments)
                 page_obj['/Contents'] = pdf.make_stream(
@@ -830,6 +872,51 @@ def tag_pdf_with_accessibility(
             except Exception as e:
                 print(f"  [warn] MCID injection failed p{page_idx + 1}: {e}")
                 continue
+
+            if not assignments:
+                continue  # No struct elements needed for this page
+
+            # Get page MediaBox for Figure /BBox attribute
+            mb = page_obj.get('/MediaBox', Array([0, 0, 612, 792]))
+            page_bbox = [float(mb[0]), float(mb[1]), float(mb[2]), float(mb[3])]
+
+            # Build struct elements; keep a slot-indexed array for the ParentTree
+            max_local_mcid = max(lm for _, lm in assignments.values())
+            parent_slot: list = [None] * (max_local_mcid + 1)
+
+            for block_idx, (tag_name, local_mcid) in assignments.items():
+                # Remap grouping types to safe leaf types
+                safe_tag = GROUPING_REMAP.get(tag_name, tag_name)
+                mcr = pdf.make_indirect(Dictionary(
+                    Type=Name('/MCR'),
+                    Pg=page_obj.obj,
+                    MCID=PikInt(local_mcid),
+                ))
+                struct_d = Dictionary(
+                    Type=Name('/StructElem'),
+                    S=Name(f'/{safe_tag}'),
+                    Pg=page_obj.obj,
+                    K=Array([mcr]),
+                )
+                tag_name = safe_tag  # use safe name for subsequent checks
+                if tag_name == 'Figure':
+                    # /Alt is required; /BBox prevents Matterhorn 17-002 failures
+                    alt = ''
+                    for elem in elements:
+                        if elem.get('type') == 'image_alt':
+                            alt = elem.get('text', '')[:500]
+                            break
+                    struct_d['/Alt'] = String(alt or 'Figure')
+                    struct_d['/A'] = pdf.make_indirect(Dictionary(
+                        O=Name('/Layout'),
+                        BBox=Array([
+                            page_bbox[0], page_bbox[1],
+                            page_bbox[2], page_bbox[3],
+                        ]),
+                    ))
+                struct_ref = pdf.make_indirect(struct_d)
+                parent_slot[local_mcid] = struct_ref
+                all_struct_elems.append(struct_ref)
 
             # Wire up StructParents: page points to its index in the ParentTree
             tree_idx = len(page_parent_arrays)
@@ -864,6 +951,9 @@ def tag_pdf_with_accessibility(
         ))
         doc_elem['/P'] = struct_root
         pdf.Root['/StructTreeRoot'] = struct_root
+
+        # Add bookmark outline (required by PDF/UA when document has sections)
+        _build_outlines(pdf, pages_data)
 
         pdf.save(output_path)
 
