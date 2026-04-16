@@ -68,7 +68,7 @@ def _execute(job: Job):
 
         from ada_remediate import (
             detect_backends, extract_text_layer, get_page_dimensions,
-            analyze_page, build_docx, MAX_PAGES,
+            analyze_page, build_docx, tag_pdf_with_accessibility, MAX_PAGES,
         )
 
         backends = detect_backends()
@@ -95,18 +95,14 @@ def _execute(job: Job):
                 analyze_page(job.pdf_path, page_num, text_layers.get(page_num, ""), backends)
             )
 
+        # Tag the original PDF with accessibility structure (preserves visual layout)
         job.progress = 90
-        build_docx(pages_data, job.output_path, page_dims=page_dims)
+        doc_title = Path(job.pdf_path).stem.replace("_", " ").title()
+        tag_pdf_with_accessibility(job.pdf_path, pages_data, job.output_pdf, title=doc_title)
 
-        # Convert .docx → tagged PDF (the actual deliverable)
+        # Also build .docx for editing/download
         job.progress = 93
-        from app.pdf_export import docx_to_pdf, is_available as lo_available
-        if lo_available():
-            pdf_ok = docx_to_pdf(job.output_path, job.output_pdf)
-            if not pdf_ok:
-                job.output_pdf = None  # PDF export failed — fall back to docx download
-        else:
-            job.output_pdf = None
+        build_docx(pages_data, job.output_path, page_dims=page_dims)
 
         # Quality check: run against .docx + PDF if available
         job.progress = 97

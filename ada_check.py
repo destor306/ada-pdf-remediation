@@ -32,6 +32,8 @@ import json
 from pathlib import Path
 from dataclasses import dataclass, field
 
+sys.stdout.reconfigure(encoding='utf-8')
+
 import pdfplumber
 from pdf2image import convert_from_path
 from docx import Document
@@ -330,11 +332,11 @@ def check_visual_similarity(source_pdf: str, output_pdf: str, report: CheckRepor
             out = out.resize(src.size, Image.LANCZOS)
 
         diff = ImageChops.difference(src, out)
-        pixels = list(diff.getdata())
-        total_pixels = len(pixels)
+        total_pixels = diff.width * diff.height
 
         # Count pixels within acceptable tolerance (diff < 30/255)
-        similar_pixels = sum(1 for p in pixels if p < 30)
+        hist = diff.histogram()  # 256-bucket histogram for grayscale
+        similar_pixels = sum(hist[:30])
         similarity = similar_pixels / total_pixels
         total_similarity += similarity
 
