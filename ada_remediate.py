@@ -31,6 +31,7 @@ sys.stdout.reconfigure(encoding='utf-8')
 from dotenv import load_dotenv
 load_dotenv()
 
+import pikepdf
 import pdfplumber
 from pdf2image import convert_from_path
 from docx import Document
@@ -534,6 +535,285 @@ def build_docx(pages_data: list[dict], output_path: str, page_dims: list[tuple[f
 
 
 # ---------------------------------------------------------------------------
+# PDF Accessibility Tagger (pikepdf-based, in-place)
+# ---------------------------------------------------------------------------
+
+def _decode_pdf_string(s) -> str:
+    """Decode a pikepdf String to a Python str."""
+    if isinstance(s, pikepdf.String):
+        raw = bytes(s)
+        if len(raw) >= 2 and raw[:2] == b'\xfe\xff':
+            return raw[2:].decode('utf-16-be', errors='replace')
+        if len(raw) >= 2 and raw[:2] == b'\xff\xfe':
+            return raw[2:].decode('utf-16-le', errors='replace')
+        return raw.decode('cp1252', errors='replace')
+    return str(s)
+
+
+def _get_block_text(instructions, start: int, end: int) -> str:
+    """Extract concatenated text from a BT..ET block."""
+    parts = []
+    for i in range(start, end + 1):
+        op = str(instructions[i].operator)
+        ops = instructions[i].operands
+        if op == 'Tj' and ops:
+            parts.append(_decode_pdf_string(ops[0]))
+        elif op == 'TJ' and ops:
+            for item in ops[0]:
+                if isinstance(item, (pikepdf.String, bytes)):
+                    parts.append(_decode_pdf_string(item))
+        elif op == "'" and ops:
+            parts.append(_decode_pdf_string(ops[0]))
+        elif op == '"' and len(ops) >= 3:
+            parts.append(_decode_pdf_string(ops[2]))
+    return ''.join(parts).strip()
+
+
+def _find_content_blocks(instructions) -> list[dict]:
+    """
+    Find all BT..ET text blocks and standalone Do (image) operators.
+    Returns list of dicts: {type, start, end, text or xobj}.
+    """
+    blocks = []
+    in_bt = False
+    bt_start = 0
+    for i, instr in enumerate(instructions):
+        op = str(instr.operator)
+        if op == 'BT':
+            in_bt = True
+            bt_start = i
+        elif op == 'ET' and in_bt:
+            text = _get_block_text(instructions, bt_start, i)
+            blocks.append({'type': 'text', 'start': bt_start, 'end': i, 'text': text})
+            in_bt = False
+        elif op == 'Do' and not in_bt:
+            xobj = str(instructions[i].operands[0]) if instructions[i].operands else '/Im'
+            blocks.append({'type': 'image', 'start': i, 'end': i, 'xobj': xobj})
+    return blocks
+
+
+def _match_blocks_to_elements(blocks: list[dict], elements: list[dict]) -> dict[int, tuple[str, int]]:
+    """
+    Match content-stream blocks to Claude-extracted elements by text overlap.
+    Returns {block_index: (tag_name, local_mcid)}.
+    """
+    TYPE_MAP = {
+        'paragraph': 'P', 'table': 'Table',
+        'list': 'L', 'caption': 'Caption', 'image_alt': 'Figure',
+    }
+
+    elem_info = []
+    for elem in elements:
+        etype = elem.get('type', 'paragraph')
+        text = elem.get('text', '').strip()
+        level = elem.get('level', 1)
+        tag = f'H{max(1, min(6, level))}' if etype == 'heading' else TYPE_MAP.get(etype, 'P')
+        if etype == 'table':
+            rows = elem.get('rows', [])
+            text = ' '.join(str(c) for c in rows[0].get('cells', [])) if rows else ''
+        elif etype == 'list':
+            text = ' '.join(elem.get('items', [])[:3])
+        elem_info.append({'tag': tag, 'text': text.lower().strip()})
+
+    assignments = {}
+    used_elements = set()
+    mcid = 0
+
+    for block_idx, block in enumerate(blocks):
+        if block['type'] == 'image':
+            assignments[block_idx] = ('Figure', mcid)
+            mcid += 1
+            continue
+
+        block_text = block.get('text', '').lower().strip()
+        if not block_text:
+            continue
+
+        best_elem, best_score = None, 0
+        for ei, elem in enumerate(elem_info):
+            if ei in used_elements or not elem['text']:
+                continue
+            bwords = set(block_text.split())
+            ewords = set(elem['text'].split())
+            overlap = len(bwords & ewords)
+            score = overlap / max(len(bwords), len(ewords))
+            if score > best_score and score > 0.2:
+                best_score = score
+                best_elem = ei
+
+        if best_elem is not None:
+            assignments[block_idx] = (elem_info[best_elem]['tag'], mcid)
+            used_elements.add(best_elem)
+            mcid += 1
+
+    return assignments
+
+
+def _inject_mcids(instructions, blocks: list[dict], assignments: dict[int, tuple[str, int]]) -> list:
+    """Return a new instruction list with BDC/EMC markers injected around assigned blocks."""
+    from pikepdf import ContentStreamInstruction, Operator, Name, Dictionary, Integer as PikInt
+
+    block_starts = {b['start']: (i, b) for i, b in enumerate(blocks) if i in assignments}
+    block_ends   = {b['end']:   i       for i, b in enumerate(blocks) if i in assignments}
+
+    new_instrs = []
+    for idx, instr in enumerate(instructions):
+        if idx in block_starts:
+            block_idx, _ = block_starts[idx]
+            tag_name, mcid_val = assignments[block_idx]
+            new_instrs.append(ContentStreamInstruction(
+                [Name(f'/{tag_name}'), Dictionary(MCID=PikInt(mcid_val))],
+                Operator('BDC'),
+            ))
+        new_instrs.append(instr)
+        if idx in block_ends:
+            new_instrs.append(ContentStreamInstruction([], Operator('EMC')))
+    return new_instrs
+
+
+def tag_pdf_with_accessibility(
+    source_pdf: str,
+    pages_data: list[dict],
+    output_path: str,
+    title: str = "",
+) -> None:
+    """
+    Create an accessible PDF by tagging the ORIGINAL document in-place.
+    Visual appearance (fonts, images, tables, layout) is preserved exactly.
+    Adds: MarkInfo, Lang, document title, and a full StructTreeRoot with MCIDs.
+    """
+    from pikepdf import Dictionary, Array, Name, String, Integer as PikInt
+
+    doc_title = title or Path(source_pdf).stem.replace("_", " ").title()
+
+    with pikepdf.open(source_pdf) as pdf:
+        # Document-level metadata
+        with pdf.open_metadata(set_pikepdf_as_editor=False) as meta:
+            if not meta.get('dc:title'):
+                meta['dc:title'] = doc_title
+            meta['dc:language'] = 'en-US'
+        pdf.Root['/Lang'] = String('en-US')
+        pdf.Root['/MarkInfo'] = Dictionary(Marked=True)
+        if '/StructTreeRoot' in pdf.Root:
+            del pdf.Root['/StructTreeRoot']
+
+        all_struct_elems = []
+        parent_tree_nums = []
+        global_mcid = 0
+
+        for page_idx, page_data in enumerate(pages_data):
+            if page_idx >= len(pdf.pages):
+                break
+            page_obj = pdf.pages[page_idx]
+            elements = page_data.get('elements', [])
+            if not elements:
+                continue
+
+            # Parse content stream
+            try:
+                raw_stream = pikepdf.parse_content_stream(page_obj)
+                blocks = _find_content_blocks(raw_stream)
+                assignments = _match_blocks_to_elements(blocks, elements)
+            except Exception as e:
+                print(f"  [warn] Stream parse failed p{page_idx + 1}: {e}")
+                blocks, assignments = [], {}
+
+            # Build struct elements for matched blocks
+            local_mcid_to_struct = {}
+            for block_idx, (tag_name, local_mcid) in assignments.items():
+                page_mcid = global_mcid + local_mcid
+                mcr = pdf.make_indirect(Dictionary(
+                    Type=Name('/MCR'),
+                    Pg=page_obj.obj,
+                    MCID=PikInt(page_mcid),
+                ))
+                struct_d = Dictionary(
+                    Type=Name('/StructElem'),
+                    S=Name(f'/{tag_name}'),
+                    Pg=page_obj.obj,
+                    K=Array([mcr]),
+                )
+                # Add Alt text for figures
+                if tag_name == 'Figure':
+                    for elem in elements:
+                        if elem.get('type') == 'image_alt':
+                            alt = elem.get('text', '')[:500]
+                            if alt:
+                                struct_d['/Alt'] = String(alt)
+                            break
+                struct_ref = pdf.make_indirect(struct_d)
+                local_mcid_to_struct[page_mcid] = struct_ref
+                all_struct_elems.append(struct_ref)
+
+            # Add unmatched table/figure elements (important for accessibility)
+            for elem in elements:
+                etype = elem.get('type')
+                if etype == 'table':
+                    rows = elem.get('rows', [])
+                    alt = ''
+                    if rows:
+                        cells = rows[0].get('cells', [])
+                        alt = 'Table: ' + ', '.join(str(c) for c in cells[:6])
+                    struct_d = Dictionary(
+                        Type=Name('/StructElem'), S=Name('/Table'), Pg=page_obj.obj,
+                    )
+                    if alt:
+                        struct_d['/Alt'] = String(alt[:500])
+                    all_struct_elems.append(pdf.make_indirect(struct_d))
+                elif etype == 'image_alt':
+                    text = elem.get('text', '')[:500]
+                    struct_d = Dictionary(
+                        Type=Name('/StructElem'), S=Name('/Figure'), Pg=page_obj.obj,
+                    )
+                    if text:
+                        struct_d['/Alt'] = String(text)
+                    all_struct_elems.append(pdf.make_indirect(struct_d))
+
+            # Inject MCIDs into content stream
+            if assignments and blocks:
+                try:
+                    global_assignments = {
+                        bi: (tag, global_mcid + lm)
+                        for bi, (tag, lm) in assignments.items()
+                    }
+                    new_stream = _inject_mcids(raw_stream, blocks, global_assignments)
+                    page_obj['/Contents'] = pdf.make_stream(
+                        pikepdf.unparse_content_stream(new_stream)
+                    )
+                    for page_mcid, struct_ref in local_mcid_to_struct.items():
+                        parent_tree_nums += [PikInt(page_mcid), struct_ref]
+                except Exception as e:
+                    print(f"  [warn] MCID injection failed p{page_idx + 1}: {e}")
+
+            if assignments:
+                global_mcid += max(lm for _, lm in assignments.values()) + 1
+
+        if not all_struct_elems:
+            pdf.save(output_path)
+            return
+
+        doc_elem = pdf.make_indirect(Dictionary(
+            Type=Name('/StructElem'),
+            S=Name('/Document'),
+            K=Array(all_struct_elems),
+        ))
+        for ref in all_struct_elems:
+            ref['/P'] = doc_elem
+
+        parent_tree = pdf.make_indirect(Dictionary(Nums=Array(parent_tree_nums)))
+        struct_root = pdf.make_indirect(Dictionary(
+            Type=Name('/StructTreeRoot'),
+            K=Array([doc_elem]),
+            ParentTree=parent_tree,
+            ParentTreeNextKey=PikInt(global_mcid),
+        ))
+        doc_elem['/P'] = struct_root
+        pdf.Root['/StructTreeRoot'] = struct_root
+
+        pdf.save(output_path)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -547,7 +827,8 @@ def main():
         print(f"Error: file not found: {pdf_path}")
         sys.exit(1)
 
-    output_path = sys.argv[2] if len(sys.argv) > 2 else Path(pdf_path).stem + "_accessible.docx"
+    docx_output_path = sys.argv[2] if len(sys.argv) > 2 else Path(pdf_path).stem + "_accessible.docx"
+    pdf_output_path  = str(Path(pdf_path).stem + "_accessible.pdf")
 
     # --- Step 1: Page count ---
     with pdfplumber.open(pdf_path) as pdf:
@@ -595,25 +876,20 @@ def main():
         elem_count = len(page_data.get("elements", []))
         print(f"{elem_count} elements")
 
-    # --- Step 6: Build Word document ---
-    print(f"\nBuilding accessible .docx → {output_path}")
-    build_docx(pages_data, output_path, page_dims=page_dims)
+    # --- Step 6: Tag original PDF with accessibility structure ---
+    # (preserves all fonts, images, tables, and layout from the source PDF)
+    print(f"\nTagging original PDF with accessibility structure → {pdf_output_path}")
+    doc_title = Path(pdf_path).stem.replace("_", " ").title()
+    tag_pdf_with_accessibility(pdf_path, pages_data, pdf_output_path, title=doc_title)
+    print(f"  ✅ Accessible PDF created (visual appearance preserved).")
 
-    # --- Step 7: Export accessible PDF via Word COM ---
-    pdf_output_path = str(Path(output_path).with_suffix(".pdf"))
-    print(f"\nExporting accessible PDF → {pdf_output_path}")
-    try:
-        from docx2pdf import convert
-        convert(output_path, pdf_output_path)
-        print(f"  ✅ PDF exported successfully.")
-    except Exception as e:
-        print(f"  ⚠️  PDF export failed: {e}")
-        print(f"     Open '{output_path}' in Word → File → Save As → PDF")
-        print(f"     ✓ Check 'Document structure tags for accessibility'")
+    # --- Step 7: Also build DOCX for editing ---
+    print(f"\nBuilding editable .docx → {docx_output_path}")
+    build_docx(pages_data, docx_output_path, page_dims=page_dims)
 
     print(f"\nDone!")
-    print(f"  Word file: {output_path}")
-    print(f"  PDF file:  {pdf_output_path}")
+    print(f"  PDF file (primary):  {pdf_output_path}  ← visually identical to source")
+    print(f"  Word file (editable): {docx_output_path}")
     print(f"\nValidate with PAC 2026: https://pac.pdf-accessibility.org")
 
 
