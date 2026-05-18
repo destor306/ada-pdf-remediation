@@ -53,8 +53,8 @@ MAX_PAGES = 500                  # hard cap
 CLAUDE_COST_PER_PAGE = 0.025     # ~$0.02–0.03 estimate
 LOCAL_COST_PER_PAGE = 0.0        # free
 
-LOCAL_MODEL = os.environ.get("LOCAL_MODEL", "qwen2-vl")
-CLAUDE_MODEL = "claude-sonnet-4-5"
+LOCAL_MODEL = os.environ.get("LOCAL_MODEL", "qwen2-vl:2b")
+CLAUDE_MODEL = "claude-sonnet-4-6"
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 
 # Poppler path (Windows — set via env or auto-detected)
@@ -159,10 +159,6 @@ def extract_text_layer(pdf_path: str) -> dict[int, str]:
 
 
 # ---------------------------------------------------------------------------
-# Shared prompt
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
 # Page dimension extraction
 # ---------------------------------------------------------------------------
 
@@ -181,6 +177,69 @@ def get_page_dimensions(pdf_path: str) -> list[tuple[float, float]]:
 
 
 # ---------------------------------------------------------------------------
+# Complexity detection
+# ---------------------------------------------------------------------------
+
+MIN_IMAGE_WIDTH  = 50   # pixels — skip tiny icons/bullets
+MIN_IMAGE_HEIGHT = 50
+
+def classify_page_complexity(pdf_path: str, page_num: int) -> str:
+    """Return 'simple' (text only) or 'complex' (has tables or images)."""
+    with pdfplumber.open(pdf_path) as pdf:
+        page = pdf.pages[page_num - 1]
+        if page.extract_tables():
+            return "complex"
+        if page.images:
+            return "complex"
+    return "simple"
+
+
+def extract_page_images(pdf_path: str, page_num: int) -> list[dict]:
+    """
+    Extract embedded images from a page using PyMuPDF.
+    Returns list of {bytes, ext, width, height, bbox} dicts, sorted top-to-bottom.
+    Skips tiny decorative images (icons, bullets).
+    """
+    import fitz
+    results = []
+    doc = fitz.open(pdf_path)
+    page = doc[page_num - 1]
+    page_h = page.rect.height
+
+    seen_xrefs = set()
+    for img_info in page.get_images(full=True):
+        xref = img_info[0]
+        if xref in seen_xrefs:
+            continue
+        seen_xrefs.add(xref)
+
+        try:
+            base = doc.extract_image(xref)
+            w, h = base["width"], base["height"]
+            if w < MIN_IMAGE_WIDTH or h < MIN_IMAGE_HEIGHT:
+                continue
+
+            # Get bounding box on the page (for vertical ordering)
+            rects = page.get_image_rects(xref)
+            bbox_y = rects[0].y0 if rects else 0
+
+            results.append({
+                "bytes": base["image"],
+                "ext":   base["ext"],
+                "width": w,
+                "height": h,
+                "bbox_y": bbox_y,
+                "xref": xref,
+            })
+        except Exception:
+            continue
+
+    doc.close()
+    results.sort(key=lambda x: x["bbox_y"])
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Shared prompt
 # ---------------------------------------------------------------------------
 
@@ -196,15 +255,17 @@ JSON schema:
   "page": <int>,
   "elements": [
     {
-      "type": "heading" | "paragraph" | "table" | "list" | "caption" | "image_alt",
-      "level": <int 1-6>,          // headings only
-      "text": "<string>",          // all types except table
-      "rows": [                    // table only
+      "type": "heading" | "paragraph" | "table" | "list" | "caption" | "image",
+      "level": <int 1-6>,               // headings only
+      "text": "<string>",               // all text types
+      "alt_text": "<string>",           // image only — descriptive alt text for accessibility
+      "caption": "<string>",            // image only — caption text visible near the image (or "")
+      "rows": [                         // table only
         { "is_header": <bool>, "cells": ["<string>", ...] }
       ],
-      "col_widths": [0.15, 0.25, 0.60],  // table only: relative column widths (must sum to 1.0)
-      "items": ["<string>", ...],  // list only
-      "ordered": <bool>            // list only
+      "col_widths": [0.15, 0.25, 0.60], // table only: relative column widths (must sum to 1.0)
+      "items": ["<string>", ...],       // list only
+      "ordered": <bool>                 // list only
     }
   ]
 }
@@ -214,7 +275,9 @@ Rules:
 - Tables: every row must have the same cell count. Identify header rows. Never merge or skip columns.
 - Multi-column layouts: linearize in logical reading order.
 - Headings: infer level from visual prominence (font size, bold, position). Level 1 = page/section title.
-- Figures/charts: use type "image_alt" with a descriptive text.
+- Images/charts/signatures/photos: use type "image". Write alt_text that describes what the image shows
+  (e.g. "Bar chart showing Q3 revenue by region", "Signature of John Smith", "Company logo").
+  Include one image element per visible image, in top-to-bottom order.
 - Footnotes: include as paragraph elements at the end.
 - Omit decorative page numbers, running headers/footers, and horizontal rules.
 - Blank page: return { "page": <n>, "elements": [] }.
@@ -222,9 +285,14 @@ Rules:
 """
 
 
-def user_message_text(page_num: int, text_hint: str) -> str:
+def user_message_text(page_num: int, text_hint: str, image_count: int = 0) -> str:
     hint = f"\nRaw text layer hint (may be garbled):\n{text_hint[:2000]}" if text_hint.strip() else ""
-    return f"This is page {page_num}.{hint}\n\nReconstruct this page as JSON per the schema."
+    img_note = (
+        f"\nThis page contains {image_count} embedded image(s) (charts, photos, signatures, logos). "
+        f"Include exactly {image_count} element(s) of type \"image\" in reading order, each with descriptive alt_text."
+        if image_count > 0 else ""
+    )
+    return f"This is page {page_num}.{hint}{img_note}\n\nReconstruct this page as JSON per the schema."
 
 
 def parse_json_response(raw: str, page_num: int) -> dict:
@@ -242,7 +310,7 @@ def parse_json_response(raw: str, page_num: int) -> dict:
 # Local model (Ollama)
 # ---------------------------------------------------------------------------
 
-def analyze_with_ollama(pdf_path: str, page_num: int, text_hint: str = "") -> dict | None:
+def analyze_with_ollama(pdf_path: str, page_num: int, text_hint: str = "", image_count: int = 0) -> dict | None:
     """Try local vision model. Returns None on failure.
 
     llava-family models do not support the 'system' role — they silently return
@@ -258,7 +326,7 @@ def analyze_with_ollama(pdf_path: str, page_num: int, text_hint: str = "") -> di
         combined = (
             f"{SYSTEM_PROMPT}\n\n"
             f"---\n"
-            f"{user_message_text(page_num, text_hint)}"
+            f"{user_message_text(page_num, text_hint, image_count)}"
         )
 
         response = client.chat(
@@ -292,7 +360,7 @@ def analyze_with_ollama(pdf_path: str, page_num: int, text_hint: str = "") -> di
 # Claude API fallback
 # ---------------------------------------------------------------------------
 
-def analyze_with_claude(pdf_path: str, page_num: int, text_hint: str = "") -> dict:
+def analyze_with_claude(pdf_path: str, page_num: int, text_hint: str = "", image_count: int = 0) -> dict:
     """Analyze page with Claude vision API."""
     import anthropic
     api_key = os.environ.get("ANTHROPIC_API_KEY")
@@ -301,7 +369,7 @@ def analyze_with_claude(pdf_path: str, page_num: int, text_hint: str = "") -> di
 
     response = client.messages.create(
         model=CLAUDE_MODEL,
-        max_tokens=4096,
+        max_tokens=8192,
         system=SYSTEM_PROMPT,
         messages=[{
             "role": "user",
@@ -310,7 +378,7 @@ def analyze_with_claude(pdf_path: str, page_num: int, text_hint: str = "") -> di
                     "type": "image",
                     "source": {"type": "base64", "media_type": "image/png", "data": image_b64},
                 },
-                {"type": "text", "text": user_message_text(page_num, text_hint)},
+                {"type": "text", "text": user_message_text(page_num, text_hint, image_count)},
             ],
         }],
     )
@@ -373,27 +441,68 @@ def analyze_with_mock(pdf_path: str, page_num: int, text_hint: str = "") -> dict
 # Page analysis dispatcher
 # ---------------------------------------------------------------------------
 
+def _attach_images_to_elements(elements: list[dict], page_images: list[dict]) -> list[dict]:
+    """
+    Match extracted image bytes to AI-generated image elements by order.
+    The AI returns image elements in reading order; we extracted images top-to-bottom.
+    Pair them positionally (1st image element ↔ 1st extracted image, etc.).
+    """
+    img_iter = iter(page_images)
+    for elem in elements:
+        if elem.get("type") == "image":
+            img = next(img_iter, None)
+            if img:
+                elem["_image_bytes"] = img["bytes"]
+                elem["_image_ext"]   = img["ext"]
+                elem["_image_width"] = img["width"]
+                elem["_image_height"] = img["height"]
+    return elements
+
+
 def analyze_page(
     pdf_path: str,
     page_num: int,
     text_hint: str,
     backends: dict,
 ) -> dict:
-    """Try local first, fall back to Claude, then mock (text-only) as last resort."""
-    if backends["ollama"]:
-        result = analyze_with_ollama(pdf_path, page_num, text_hint)
-        if result is not None:
-            return result
-
-    if backends["claude"]:
-        print(f"    → Using Claude API fallback for page {page_num}")
-        return analyze_with_claude(pdf_path, page_num, text_hint)
-
-    if backends.get("mock"):
+    """
+    Tiered analysis:
+    - Simple pages (text only, no tables/images): use mock/text extraction — free, instant.
+    - Complex pages (tables, images): extract real images, then run AI for structure + alt text.
+    """
+    # Forced mock mode
+    if backends.get("mock") and os.environ.get("MOCK_MODE") == "1":
         return analyze_with_mock(pdf_path, page_num, text_hint)
 
-    print(f"  [error] No backend available for page {page_num}. Returning empty.")
-    return {"page": page_num, "elements": []}
+    # Complexity check — skip AI entirely for simple pages
+    complexity = classify_page_complexity(pdf_path, page_num)
+    if complexity == "simple" and not backends["ollama"] and not backends["claude"]:
+        return analyze_with_mock(pdf_path, page_num, text_hint)
+    if complexity == "simple":
+        # Simple page: text extraction is sufficient, no AI needed
+        return analyze_with_mock(pdf_path, page_num, text_hint)
+
+    # Complex page: extract real images first
+    page_images = extract_page_images(pdf_path, page_num)
+    image_count = len(page_images)
+
+    result = None
+
+    if backends["ollama"]:
+        result = analyze_with_ollama(pdf_path, page_num, text_hint, image_count)
+
+    if result is None and backends["claude"]:
+        print(f"    → Using Claude API fallback for page {page_num}")
+        result = analyze_with_claude(pdf_path, page_num, text_hint, image_count)
+
+    if result is None:
+        result = analyze_with_mock(pdf_path, page_num, text_hint)
+
+    # Attach real image bytes to image elements
+    if page_images:
+        result["elements"] = _attach_images_to_elements(result.get("elements", []), page_images)
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -516,10 +625,48 @@ def build_docx(pages_data: list[dict], output_path: str, page_dims: list[tuple[f
                 if text:
                     doc.add_paragraph(text, style="Caption")
 
-            elif etype == "image_alt":
-                p = doc.add_paragraph(f"[Figure: {text}]")
-                if p.runs:
-                    p.runs[0].italic = True
+            elif etype in ("image", "image_alt"):
+                img_bytes = elem.get("_image_bytes")
+                alt = elem.get("alt_text") or elem.get("text") or ""
+                caption_text = elem.get("caption", "")
+
+                if img_bytes:
+                    # Embed the real extracted image
+                    img_width  = elem.get("_image_width", 1)
+                    img_height = elem.get("_image_height", 1)
+                    # Fit within usable page width (page_w minus margins)
+                    max_w = page_w - 1.5
+                    aspect = img_height / img_width if img_width else 1
+                    fit_w = min(max_w, max_w)   # full width by default
+                    fit_h = fit_w * aspect
+                    # If taller than half a page, shrink to fit
+                    max_h = (page_dims[idx][1] if page_dims and idx < len(page_dims) else 11.0) * 0.5
+                    if fit_h > max_h:
+                        fit_h = max_h
+                        fit_w = fit_h / aspect
+
+                    p = doc.add_paragraph()
+                    p.alignment = 1  # center
+                    run = p.add_run()
+                    run.add_picture(io.BytesIO(img_bytes), width=Inches(fit_w))
+
+                    # Add alt text to the drawing XML
+                    try:
+                        drawing = run._r.find('.//{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}inline')
+                        if drawing is not None:
+                            docPr = drawing.find('{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}docPr')
+                            if docPr is not None and alt:
+                                docPr.set('descr', alt)
+                    except Exception:
+                        pass
+                else:
+                    # Fallback: no image bytes extracted, show placeholder
+                    p = doc.add_paragraph(f"[Figure: {alt}]")
+                    if p.runs:
+                        p.runs[0].italic = True
+
+                if caption_text:
+                    doc.add_paragraph(caption_text, style="Caption")
 
         if idx < len(pages_data) - 1:
             # Add page break and new section if page size changes
@@ -822,7 +969,7 @@ def tag_pdf_with_accessibility(
             # Required to declare PDF/UA-1 conformance (Matterhorn 06-001)
             meta['pdfuaid:part'] = '1'
         pdf.Root['/Lang'] = String('en-US')
-        pdf.Root['/MarkInfo'] = Dictionary(Marked=True)
+        pdf.Root['/MarkInfo'] = Dictionary(Marked=True, Suspects=False)
 
         # PDF/UA requires the document title to be shown in the title bar
         if '/ViewerPreferences' not in pdf.Root:
@@ -962,25 +1109,35 @@ def tag_pdf_with_accessibility(
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
-    if len(sys.argv) < 2:
-        print(__doc__)
-        sys.exit(1)
+def _parse_args():
+    import argparse
+    parser = argparse.ArgumentParser(description="ADA PDF Remediation Tool")
+    parser.add_argument("input", help="Input PDF file")
+    parser.add_argument("output", nargs="?", help="Output .docx path (optional)")
+    parser.add_argument("--pages", type=int, metavar="N", help="Only process first N pages (cheap testing)")
+    return parser.parse_args()
 
-    pdf_path = sys.argv[1]
+
+def main():
+    args = _parse_args()
+    pdf_path = args.input
+
     if not os.path.exists(pdf_path):
         print(f"Error: file not found: {pdf_path}")
         sys.exit(1)
 
-    docx_output_path = sys.argv[2] if len(sys.argv) > 2 else Path(pdf_path).stem + "_accessible.docx"
+    docx_output_path = args.output if args.output else Path(pdf_path).stem + "_accessible.docx"
     pdf_output_path  = str(Path(pdf_path).stem + "_accessible.pdf")
 
     # --- Step 1: Page count ---
     with pdfplumber.open(pdf_path) as pdf:
         total_pages = len(pdf.pages)
     pages_to_process = min(total_pages, MAX_PAGES)
+    if args.pages:
+        pages_to_process = min(args.pages, pages_to_process)
     print(f"\nPDF: {pdf_path}")
-    print(f"Pages: {total_pages}" + (f" (capped at {MAX_PAGES})" if total_pages > MAX_PAGES else ""))
+    page_note = f" (processing {pages_to_process}/{total_pages})" if pages_to_process < total_pages else ""
+    print(f"Pages: {total_pages}{page_note}")
 
     # --- Step 2: Detect backends and show cost estimate ---
     print("\nDetecting AI backends...")
@@ -1008,18 +1165,39 @@ def main():
     page_dims = get_page_dimensions(pdf_path)
     print(f"  Page sizes: {', '.join(f'{w:.1f}\"×{h:.1f}\"' for w, h in page_dims[:pages_to_process])}")
 
+    # Classify complexity so users can see AI usage upfront
+    print("\nClassifying pages...")
+    complexities = {n: classify_page_complexity(pdf_path, n) for n in range(1, pages_to_process + 1)}
+    simple_count  = sum(1 for v in complexities.values() if v == "simple")
+    complex_count = sum(1 for v in complexities.values() if v == "complex")
+    print(f"  Simple (text only, no AI): {simple_count} page(s)")
+    print(f"  Complex (tables/images, AI needed): {complex_count} page(s)")
+
+    # Re-estimate cost based on actual complex page count only
+    if complex_count < pages_to_process:
+        cost, cost_note = estimate_cost(complex_count, backends)
+        print(f"  Revised cost estimate (complex pages only): {cost_note}")
+
     # --- Step 5: Analyze pages ---
     pages_data = []
-    claude_pages = 0
-    local_pages = 0
 
     for page_num in range(1, pages_to_process + 1):
-        backend_hint = f"(ollama)" if backends["ollama"] else "(claude)"
-        print(f"  Page {page_num}/{pages_to_process} {backend_hint}...", end=" ", flush=True)
+        complexity = complexities[page_num]
+        if os.environ.get("MOCK_MODE") == "1":
+            label = "mock"
+        elif complexity == "simple":
+            label = "simple"
+        elif backends["ollama"]:
+            label = "ollama"
+        else:
+            label = "claude"
+        print(f"  Page {page_num}/{pages_to_process} [{label}]...", end=" ", flush=True)
         page_data = analyze_page(pdf_path, page_num, text_layers.get(page_num, ""), backends)
         pages_data.append(page_data)
         elem_count = len(page_data.get("elements", []))
-        print(f"{elem_count} elements")
+        img_count  = sum(1 for e in page_data.get("elements", []) if e.get("_image_bytes"))
+        img_note   = f", {img_count} image(s) embedded" if img_count else ""
+        print(f"{elem_count} elements{img_note}")
 
     # --- Step 6: Tag original PDF with accessibility structure ---
     # (preserves all fonts, images, tables, and layout from the source PDF)
