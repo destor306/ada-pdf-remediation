@@ -18,14 +18,15 @@ JobStatus = Literal["queued", "running", "done", "failed"]
 
 
 class Job:
-    def __init__(self, job_id: str, pdf_path: str, output_path: str, use_claude: bool = False, notify_email: str = "", user_id: int | None = None):
-        self.id           = job_id
-        self.pdf_path     = pdf_path
-        self.output_path  = output_path          # .docx (intermediate)
-        self.output_pdf   = output_path.replace(".docx", "_ada.pdf")  # final output
-        self.use_claude   = use_claude
-        self.notify_email = notify_email
-        self.user_id      = user_id
+    def __init__(self, job_id: str, pdf_path: str, output_path: str, use_claude: bool = False, notify_email: str = "", user_id: int | None = None, original_stem: str = ""):
+        self.id              = job_id
+        self.pdf_path        = pdf_path
+        self.output_path     = output_path          # .docx (intermediate)
+        self.output_pdf      = output_path.replace(".docx", "_ada.pdf")  # final output
+        self.use_claude      = use_claude
+        self.notify_email    = notify_email
+        self.user_id         = user_id
+        self.original_stem   = original_stem or Path(pdf_path).stem
         self.status: JobStatus = "queued"
         self.progress     = 0
         self.current_page = 0
@@ -101,9 +102,15 @@ def _execute(job: Job):
         doc_title = Path(job.pdf_path).stem.replace("_", " ").title()
         tag_pdf_with_accessibility(job.pdf_path, pages_data, job.output_pdf, title=doc_title)
 
-        # Also build .docx for editing/download
+        # Build .docx — use pdf2docx for pixel-accurate layout, fall back to custom builder
         job.progress = 93
-        build_docx(pages_data, job.output_path, page_dims=page_dims)
+        try:
+            from pdf2docx import Converter
+            cv = Converter(job.pdf_path)
+            cv.convert(job.output_path, start=0, end=None)
+            cv.close()
+        except Exception:
+            build_docx(pages_data, job.output_path, page_dims=page_dims)
 
         # Quality check: run against .docx + PDF if available
         job.progress = 97
@@ -160,8 +167,8 @@ def _execute(job: Job):
             notify_failed(job.notify_email, job.id)
 
 
-def create_job(pdf_path: str, output_path: str, use_claude: bool = False, notify_email: str = "", user_id: int | None = None) -> Job:
-    job = Job(str(uuid.uuid4()), pdf_path, output_path, use_claude, notify_email, user_id)
+def create_job(pdf_path: str, output_path: str, use_claude: bool = False, notify_email: str = "", user_id: int | None = None, original_stem: str = "") -> Job:
+    job = Job(str(uuid.uuid4()), pdf_path, output_path, use_claude, notify_email, user_id, original_stem)
     _store(job)
     return job
 

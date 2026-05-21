@@ -3,226 +3,337 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Dashboard — ADA PDF Remediation</title>
+  <title>Dashboard — AccessiFix</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      background: #f0f4f8;
-      min-height: 100vh;
-      padding: 2rem 1rem;
+    :root {
+      --blue: #2563EB; --blue-dk: #1D4ED8; --blue-lt: #EFF6FF;
+      --navy: #0F172A; --slate: #1E293B; --gray: #64748B;
+      --border: #E2E8F0; --surface: #F8FAFC; --white: #FFFFFF;
+      --green: #059669; --green-lt: #ECFDF5;
+      --amber: #D97706; --amber-lt: #FFFBEB;
+      --red: #DC2626; --red-lt: #FEF2F2;
+      --radius: 12px;
     }
+    body { font-family: 'Inter', sans-serif; background: var(--surface); color: var(--navy); min-height: 100vh; }
+
+    /* TOP NAV */
     nav {
-      max-width: 800px;
-      margin: 0 auto 2rem;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
+      background: white;
+      border-bottom: 1px solid var(--border);
+      padding: 0 2rem;
+      position: sticky;
+      top: 0;
+      z-index: 50;
     }
-    .nav-logo { font-size: 1.2rem; font-weight: 700; color: #2b6cb0; text-decoration: none; }
-    .nav-links a {
-      color: #4a5568;
-      text-decoration: none;
-      font-size: 0.9rem;
-      margin-left: 1.5rem;
+    .nav-inner { max-width: 1100px; margin: 0 auto; height: 60px; display: flex; align-items: center; justify-content: space-between; }
+    .nav-logo { font-size: 1.1rem; font-weight: 800; color: var(--navy); text-decoration: none; display: flex; align-items: center; gap: .4rem; }
+    .nav-logo span { background: var(--blue); color: white; padding: .12rem .4rem; border-radius: 5px; font-size: .75rem; font-weight: 700; }
+    .nav-right { display: flex; align-items: center; gap: 1rem; }
+    .nav-email { font-size: .82rem; color: var(--gray); font-weight: 500; }
+    .nav-upload {
+      font-size: .85rem; font-weight: 600; color: white;
+      background: var(--blue); text-decoration: none;
+      padding: .4rem .9rem; border-radius: 8px;
+      transition: background .15s;
     }
-    .nav-links a:hover { color: #2b6cb0; }
-    .container { max-width: 800px; margin: 0 auto; }
-    h1 { font-size: 1.7rem; color: #1a202c; margin-bottom: 0.3rem; }
-    .subtitle { color: #718096; font-size: 0.9rem; margin-bottom: 2rem; }
-    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; margin-bottom: 1.5rem; }
-    @media (max-width: 600px) { .grid { grid-template-columns: 1fr; } }
+    .nav-upload:hover { background: var(--blue-dk); }
+    .nav-signout { font-size: .82rem; color: var(--gray); text-decoration: none; }
+    .nav-signout:hover { color: var(--navy); }
+
+    /* LAYOUT */
+    .page { max-width: 1100px; margin: 0 auto; padding: 2.5rem 2rem; }
+    .page-header { margin-bottom: 2rem; }
+    .page-header h1 { font-size: 1.6rem; font-weight: 800; letter-spacing: -.02em; }
+    .page-header p { font-size: .9rem; color: var(--gray); margin-top: .25rem; }
+
+    /* PLAN BADGE */
+    .plan-badge {
+      display: inline-flex; align-items: center; gap: .35rem;
+      padding: .25rem .75rem; border-radius: 99px;
+      font-size: .72rem; font-weight: 700; text-transform: uppercase; letter-spacing: .06em;
+    }
+    .plan-free     { background: #F1F5F9; color: #475569; }
+    .plan-payg     { background: var(--blue-lt); color: var(--blue); }
+    .plan-pro      { background: var(--green-lt); color: var(--green); }
+    .plan-business { background: var(--amber-lt); color: var(--amber); }
+
+    /* TOP CARDS ROW */
+    .cards-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; margin-bottom: 1.5rem; }
     .card {
       background: white;
-      border-radius: 12px;
-      box-shadow: 0 2px 12px rgba(0,0,0,0.07);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
       padding: 1.5rem;
     }
-    .card h2 { font-size: 1rem; color: #4a5568; font-weight: 500; margin-bottom: 1rem; }
-    .stat-big { font-size: 2.5rem; font-weight: 800; color: #2b6cb0; }
-    .stat-label { font-size: 0.82rem; color: #a0aec0; margin-top: 0.2rem; }
+    .card-label { font-size: .78rem; font-weight: 600; color: var(--gray); text-transform: uppercase; letter-spacing: .06em; margin-bottom: .75rem; display: flex; align-items: center; gap: .4rem; }
+    .card-label svg { color: var(--gray); }
+    .card-value { font-size: 2.4rem; font-weight: 900; color: var(--navy); line-height: 1; }
+    .card-value.unlimited { font-size: 2rem; }
+    .card-sub { font-size: .8rem; color: var(--gray); margin-top: .35rem; }
 
-    .plan-badge {
-      display: inline-block;
-      padding: 0.25rem 0.7rem;
-      border-radius: 99px;
-      font-size: 0.78rem;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-    }
-    .plan-free     { background: #e2e8f0; color: #4a5568; }
-    .plan-payg     { background: #ebf8ff; color: #2b6cb0; }
-    .plan-pro      { background: #d6f5e9; color: #276749; }
-    .plan-business { background: #fef3c7; color: #92400e; }
+    /* USAGE BAR */
+    .usage-bar-bg { background: var(--border); border-radius: 99px; height: 6px; overflow: hidden; margin: .75rem 0; }
+    .usage-bar-fill { background: linear-gradient(90deg, var(--blue), #60A5FA); height: 100%; border-radius: 99px; transition: width .6s cubic-bezier(.4,0,.2,1); }
+    .usage-bar-fill.warn { background: linear-gradient(90deg, var(--red), #F87171); }
+    .usage-meta { display: flex; justify-content: space-between; font-size: .75rem; color: var(--gray); }
 
-    .usage-bar-bg {
-      background: #e2e8f0;
-      border-radius: 99px;
-      height: 8px;
-      overflow: hidden;
-      margin: 0.75rem 0;
-    }
-    .usage-bar-fill {
-      background: #3182ce;
-      height: 100%;
-      border-radius: 99px;
-      transition: width 0.4s;
-    }
-    .usage-bar-fill.warn { background: #e53e3e; }
+    /* UPGRADE SECTION */
+    .upgrade-section { background: white; border: 1px solid var(--border); border-radius: var(--radius); padding: 1.75rem; margin-bottom: 1.5rem; }
+    .upgrade-section h2 { font-size: 1.05rem; font-weight: 700; margin-bottom: .35rem; }
+    .upgrade-section p { font-size: .875rem; color: var(--gray); margin-bottom: 1.5rem; }
 
-    .btn {
-      display: inline-block;
-      padding: 0.55rem 1.2rem;
-      border-radius: 8px;
-      font-weight: 600;
-      font-size: 0.88rem;
-      cursor: pointer;
-      border: none;
-      text-decoration: none;
-      transition: opacity 0.15s;
-    }
-    .btn:hover { opacity: 0.87; }
-    .btn-primary { background: #3182ce; color: white; }
-    .btn-outline { background: white; color: #3182ce; border: 1.5px solid #3182ce; }
-    .btn-danger  { background: white; color: #e53e3e; border: 1.5px solid #e53e3e; }
-
-    .plan-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 0.75rem; margin-top: 1rem; }
+    .plans-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(175px, 1fr)); gap: .75rem; }
     .plan-card {
-      border: 1.5px solid #e2e8f0;
+      border: 1.5px solid var(--border);
       border-radius: 10px;
-      padding: 1rem 0.75rem;
-      text-align: center;
+      padding: 1.25rem;
+      display: flex;
+      flex-direction: column;
+      transition: box-shadow .15s, border-color .15s;
+      position: relative;
     }
-    .plan-card.current { border-color: #3182ce; background: #ebf8ff; }
-    .plan-card .name { font-weight: 700; font-size: 0.9rem; color: #2d3748; }
-    .plan-card .price { font-size: 1.3rem; font-weight: 800; color: #3182ce; margin: 0.25rem 0; }
-    .plan-card .desc { font-size: 0.75rem; color: #718096; }
-    .plan-card .select-btn { margin-top: 0.75rem; display: block; width: 100%; padding: 0.4rem; font-size: 0.8rem; font-weight: 600; border-radius: 6px; cursor: pointer; border: 1.5px solid #3182ce; background: white; color: #3182ce; }
-    .plan-card.current .select-btn { background: #3182ce; color: white; cursor: default; }
-    .plan-card .select-btn:hover:not(:disabled) { background: #ebf8ff; }
+    .plan-card:hover { border-color: var(--blue); box-shadow: 0 4px 20px rgba(37,99,235,.1); }
+    .plan-card.current { border-color: var(--blue); background: var(--blue-lt); }
+    .plan-card .plan-name { font-size: .82rem; font-weight: 700; color: var(--slate); margin-bottom: .4rem; }
+    .plan-card .plan-price { font-size: 1.5rem; font-weight: 900; color: var(--navy); line-height: 1; }
+    .plan-card .plan-price sub { font-size: .78rem; font-weight: 500; color: var(--gray); }
+    .plan-card .plan-pages { font-size: .75rem; color: var(--gray); margin: .35rem 0 1rem; }
+    .plan-card .plan-btn {
+      margin-top: auto;
+      display: block;
+      text-align: center;
+      padding: .5rem;
+      border-radius: 7px;
+      font-size: .8rem;
+      font-weight: 600;
+      cursor: pointer;
+      border: 1.5px solid var(--border);
+      background: white;
+      color: var(--slate);
+      font-family: inherit;
+      transition: all .15s;
+    }
+    .plan-card.current .plan-btn { background: var(--blue); color: white; border-color: var(--blue); cursor: default; }
+    .plan-card:not(.current) .plan-btn:hover { border-color: var(--blue); color: var(--blue); background: var(--blue-lt); }
+    .plan-popular {
+      position: absolute;
+      top: -10px; left: 50%; transform: translateX(-50%);
+      background: var(--blue); color: white;
+      font-size: .65rem; font-weight: 700;
+      padding: .15rem .55rem; border-radius: 99px;
+      text-transform: uppercase; letter-spacing: .06em;
+      white-space: nowrap;
+    }
 
-    .info-row { display: flex; justify-content: space-between; align-items: center; padding: 0.6rem 0; border-bottom: 1px solid #f0f4f8; font-size: 0.88rem; }
-    .info-row:last-child { border-bottom: none; }
-    .info-row .label { color: #718096; }
-    .info-row .value { font-weight: 500; color: #2d3748; }
+    /* QUICK ACTIONS */
+    .actions-section { background: white; border: 1px solid var(--border); border-radius: var(--radius); padding: 1.75rem; }
+    .actions-section h2 { font-size: 1.05rem; font-weight: 700; margin-bottom: 1.25rem; }
+    .actions-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: .75rem; }
+    .action-card {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1.25rem;
+      text-decoration: none;
+      color: var(--navy);
+      display: flex;
+      align-items: flex-start;
+      gap: .85rem;
+      transition: border-color .15s, box-shadow .15s;
+    }
+    .action-card:hover { border-color: var(--blue); box-shadow: 0 2px 12px rgba(37,99,235,.1); }
+    .action-icon { width: 40px; height: 40px; border-radius: 9px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+    .action-icon.blue { background: var(--blue-lt); color: var(--blue); }
+    .action-icon.green { background: var(--green-lt); color: var(--green); }
+    .action-icon.gray { background: var(--surface); color: var(--gray); }
+    .action-card h3 { font-size: .9rem; font-weight: 600; margin-bottom: .15rem; }
+    .action-card p { font-size: .78rem; color: var(--gray); line-height: 1.4; }
 
-    .action-card { display: flex; gap: 1rem; flex-wrap: wrap; align-items: center; }
-
-    .alert { padding: 0.75rem 1rem; border-radius: 8px; font-size: 0.88rem; margin-bottom: 1rem; }
-    .alert-success { background: #c6f6d5; color: #276749; }
-    .alert-info    { background: #ebf8ff; color: #2c5282; }
+    /* TOAST */
+    #toast {
+      position: fixed; bottom: 1.5rem; right: 1.5rem;
+      background: var(--navy); color: white;
+      padding: .8rem 1.25rem; border-radius: 10px;
+      font-size: .875rem; font-weight: 500;
+      box-shadow: 0 8px 32px rgba(0,0,0,.25);
+      transform: translateY(4rem); opacity: 0;
+      transition: all .25s cubic-bezier(.4,0,.2,1);
+      z-index: 999;
+    }
+    #toast.show { transform: translateY(0); opacity: 1; }
   </style>
 </head>
 <body>
 
 <nav>
-  <a href="/" class="nav-logo">ADA PDF Remediation</a>
-  <div class="nav-links">
-    <a href="/">Upload PDF</a>
-    <a href="/auth/logout">Sign out</a>
+  <div class="nav-inner">
+    <a href="/" class="nav-logo">AccessiFix <span>ADA</span></a>
+    <div class="nav-right">
+      <span class="nav-email">{{ user.email }}</span>
+      <a href="/" class="nav-upload">Upload PDF</a>
+      <a href="/auth/logout" class="nav-signout">Sign out</a>
+    </div>
   </div>
 </nav>
 
-<div class="container">
-  <h1>Welcome back</h1>
-  <p class="subtitle">{{ user.email }}</p>
+<div class="page">
+  <div class="page-header">
+    <div style="display:flex;align-items:center;gap:.75rem;flex-wrap:wrap;margin-bottom:.5rem;">
+      <h1>My Dashboard</h1>
+      <span class="plan-badge plan-{{ user.plan.value }}">{{ user.plan.value }}</span>
+    </div>
+    <p>Manage your plan and track your monthly usage.</p>
+  </div>
 
-  <div class="grid">
-
-    <!-- Usage card -->
+  <!-- STATS CARDS -->
+  <div class="cards-row">
+    <!-- Pages remaining -->
     <div class="card">
-      <h2>This month's usage</h2>
+      <div class="card-label">
+        <svg width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m0 12.75h7.5m-7.5 3H12M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z"/></svg>
+        Pages this month
+      </div>
       {% if pages_remaining is none %}
-        <div class="stat-big">&#8734;</div>
-        <div class="stat-label">Unlimited pages (Pay-as-you-go)</div>
+        <div class="card-value unlimited">Unlimited</div>
+        <div class="card-sub">Pay-as-you-go — charged per page</div>
       {% else %}
-        <div class="stat-big">{{ pages_remaining }}</div>
-        <div class="stat-label">pages remaining</div>
         {% set limit = {"free": 3, "pro": 200, "business": 1000}.get(user.plan.value, 3) %}
         {% set pct = ((pages_used / limit) * 100) | int if limit > 0 else 0 %}
-        <div class="usage-bar-bg">
-          <div class="usage-bar-fill {% if pct >= 90 %}warn{% endif %}" style="width: {{ [pct, 100] | min }}%"></div>
+        <div class="card-value">{{ pages_remaining }}</div>
+        <div class="card-sub">pages remaining</div>
+        <div class="usage-bar-bg" style="margin-top:.75rem;">
+          <div class="usage-bar-fill {% if pct >= 90 %}warn{% endif %}" style="width:{{ [pct, 100] | min }}%"></div>
         </div>
-        <div style="font-size:0.8rem;color:#718096;">{{ pages_used }} of {{ limit }} used</div>
+        <div class="usage-meta">
+          <span>{{ pages_used }} used</span>
+          <span>{{ limit }} total</span>
+        </div>
       {% endif %}
     </div>
 
-    <!-- Plan card -->
+    <!-- Current plan -->
     <div class="card">
-      <h2>Your plan</h2>
-      <span class="plan-badge plan-{{ user.plan.value }}">{{ user.plan.value | upper }}</span>
-      <div style="margin-top:1rem;">
-        <div class="info-row">
-          <span class="label">Account</span>
-          <span class="value">{{ user.email }}</span>
-        </div>
-        {% if user.stripe_sub_id %}
-        <div class="info-row">
-          <span class="label">Subscription</span>
-          <span class="value" style="color:#38a169;">Active</span>
-        </div>
-        {% endif %}
+      <div class="card-label">
+        <svg width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09z"/></svg>
+        Current plan
       </div>
+      <div class="card-value" style="font-size:1.6rem;text-transform:capitalize;">{{ user.plan.value }}</div>
+      <div class="card-sub">
+        {% if user.plan.value == 'free' %}3 pages/month included{% endif %}
+        {% if user.plan.value == 'payg' %}$0.05/page, no commitment{% endif %}
+        {% if user.plan.value == 'pro' %}200 pages/month · $19/mo{% endif %}
+        {% if user.plan.value == 'business' %}1,000 pages/month · $79/mo{% endif %}
+      </div>
+      {% if user.stripe_sub_id %}
+      <div style="margin-top:.75rem;display:flex;align-items:center;gap:.4rem;font-size:.78rem;color:var(--green);font-weight:600;">
+        <svg width="14" height="14" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.857-9.809a.75.75 0 00-1.214-.882l-3.483 4.79-1.88-1.88a.75.75 0 10-1.06 1.061l2.5 2.5a.75.75 0 001.137-.089l4-5.5z" clip-rule="evenodd"/></svg>
+        Subscription active
+      </div>
+      {% endif %}
     </div>
 
+    <!-- Account -->
+    <div class="card">
+      <div class="card-label">
+        <svg width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M15.75 6a3.75 3.75 0 11-7.5 0 3.75 3.75 0 017.5 0zM4.501 20.118a7.5 7.5 0 0114.998 0A17.933 17.933 0 0112 21.75c-2.676 0-5.216-.584-7.499-1.632z"/></svg>
+        Account
+      </div>
+      <div class="card-value" style="font-size:1rem;font-weight:600;word-break:break-all;">{{ user.email }}</div>
+      <div class="card-sub" style="margin-top:.4rem;">
+        Member since {{ user.created_at.strftime('%b %Y') if user.created_at else '—' }}
+      </div>
+    </div>
   </div>
 
-  <!-- Upgrade card -->
-  <div class="card" style="margin-bottom:1.5rem;">
-    <h2>Upgrade plan</h2>
-    <div class="plan-cards">
+  <!-- UPGRADE SECTION -->
+  <div class="upgrade-section">
+    <h2>Plans & Billing</h2>
+    <p>Upgrade to unlock more pages or switch to pay-as-you-go for flexible usage.</p>
 
+    <div class="plans-grid">
       <div class="plan-card {% if user.plan.value == 'free' %}current{% endif %}">
-        <div class="name">Free</div>
-        <div class="price">$0</div>
-        <div class="desc">3 pages/month</div>
-        <button class="select-btn" {% if user.plan.value == 'free' %}disabled{% else %}onclick="subscribe('free')"{% endif %}>
-          {% if user.plan.value == 'free' %}Current plan{% else %}Downgrade{% endif %}
+        <div class="plan-name">Free</div>
+        <div class="plan-price">$0</div>
+        <div class="plan-pages">3 pages/month</div>
+        <button class="plan-btn" {% if user.plan.value == 'free' %}disabled{% else %}onclick="subscribe('free')"{% endif %}>
+          {% if user.plan.value == 'free' %}Current plan{% else %}Switch to Free{% endif %}
         </button>
       </div>
 
-      <div class="plan-card {% if user.plan.value == 'payg' %}current{% endif %}">
-        <div class="name">Pay-as-you-go</div>
-        <div class="price">$0.05<span style="font-size:.75rem;font-weight:400;">/page</span></div>
-        <div class="desc">No commitment</div>
-        <button class="select-btn" {% if user.plan.value == 'payg' %}disabled{% else %}onclick="subscribe('payg')"{% endif %}>
+      <div class="plan-card {% if user.plan.value == 'payg' %}current{% endif %}" style="position:relative;">
+        {% if user.plan.value != 'payg' %}<div class="plan-popular">Popular</div>{% endif %}
+        <div class="plan-name">Pay-as-you-go</div>
+        <div class="plan-price">$0.05<sub>/page</sub></div>
+        <div class="plan-pages">No commitment</div>
+        <button class="plan-btn" {% if user.plan.value == 'payg' %}disabled{% else %}onclick="subscribe('payg')"{% endif %}>
           {% if user.plan.value == 'payg' %}Current plan{% else %}Select{% endif %}
         </button>
       </div>
 
       <div class="plan-card {% if user.plan.value == 'pro' %}current{% endif %}">
-        <div class="name">Pro</div>
-        <div class="price">$19<span style="font-size:.75rem;font-weight:400;">/mo</span></div>
-        <div class="desc">200 pages/month</div>
-        <button class="select-btn" {% if user.plan.value == 'pro' %}disabled{% else %}onclick="subscribe('pro')"{% endif %}>
-          {% if user.plan.value == 'pro' %}Current plan{% else %}Upgrade{% endif %}
+        <div class="plan-name">Pro</div>
+        <div class="plan-price">$19<sub>/mo</sub></div>
+        <div class="plan-pages">200 pages/month</div>
+        <button class="plan-btn" {% if user.plan.value == 'pro' %}disabled{% else %}onclick="subscribe('pro')"{% endif %}>
+          {% if user.plan.value == 'pro' %}Current plan{% else %}Upgrade to Pro{% endif %}
         </button>
       </div>
 
       <div class="plan-card {% if user.plan.value == 'business' %}current{% endif %}">
-        <div class="name">Business</div>
-        <div class="price">$79<span style="font-size:.75rem;font-weight:400;">/mo</span></div>
-        <div class="desc">1,000 pages/month</div>
-        <button class="select-btn" {% if user.plan.value == 'business' %}disabled{% else %}onclick="subscribe('business')"{% endif %}>
-          {% if user.plan.value == 'business' %}Current plan{% else %}Upgrade{% endif %}
+        <div class="plan-name">Business</div>
+        <div class="plan-price">$79<sub>/mo</sub></div>
+        <div class="plan-pages">1,000 pages/month</div>
+        <button class="plan-btn" {% if user.plan.value == 'business' %}disabled{% else %}onclick="subscribe('business')"{% endif %}>
+          {% if user.plan.value == 'business' %}Current plan{% else %}Upgrade to Business{% endif %}
         </button>
       </div>
-
     </div>
   </div>
 
-  <!-- Quick actions -->
-  <div class="card action-card">
-    <a href="/" class="btn btn-primary">Upload a PDF</a>
-    <a href="/auth/logout" class="btn btn-outline">Sign out</a>
-  </div>
+  <!-- QUICK ACTIONS -->
+  <div class="actions-section">
+    <h2>Quick actions</h2>
+    <div class="actions-grid">
+      <a href="/" class="action-card">
+        <div class="action-icon blue">
+          <svg width="20" height="20" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.8"><path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5"/></svg>
+        </div>
+        <div>
+          <h3>Upload a PDF</h3>
+          <p>Convert a new document to ADA-compliant format</p>
+        </div>
+      </a>
 
+      <a href="https://pac.pdf-accessibility.org" target="_blank" class="action-card">
+        <div class="action-icon green">
+          <svg width="20" height="20" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.8"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75L11.25 15 15 9.75m-3-7.036A11.959 11.959 0 013.598 6 11.99 11.99 0 003 9.749c0 5.592 3.824 10.29 9 11.623 5.176-1.332 9-6.03 9-11.622 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.248-8.25-3.285z"/></svg>
+        </div>
+        <div>
+          <h3>Validate with PAC 2026</h3>
+          <p>Upload your output to the gold-standard compliance checker</p>
+        </div>
+      </a>
+
+      <a href="/auth/logout" class="action-card">
+        <div class="action-icon gray">
+          <svg width="20" height="20" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.8"><path stroke-linecap="round" stroke-linejoin="round" d="M15.75 9V5.25A2.25 2.25 0 0013.5 3h-6a2.25 2.25 0 00-2.25 2.25v13.5A2.25 2.25 0 007.5 21h6a2.25 2.25 0 002.25-2.25V15M12 9l-3 3m0 0l3 3m-3-3h12.75"/></svg>
+        </div>
+        <div>
+          <h3>Sign out</h3>
+          <p>Log out of your account</p>
+        </div>
+      </a>
+    </div>
+  </div>
 </div>
+
+<div id="toast"></div>
 
 <script>
 async function subscribe(plan) {
-  const res = await fetch('/api/subscribe', {
+  const res  = await fetch('/api/subscribe', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ plan }),
@@ -231,11 +342,18 @@ async function subscribe(plan) {
   if (data.checkout_url) {
     window.location.href = data.checkout_url;
   } else if (data.message) {
-    alert(data.message);
-    window.location.reload();
+    showToast(data.message);
+    setTimeout(() => window.location.reload(), 1200);
   } else {
-    alert('Something went wrong. Please try again.');
+    showToast('Something went wrong. Please try again.');
   }
+}
+
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 3000);
 }
 </script>
 

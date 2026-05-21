@@ -6,6 +6,7 @@ pikepdf>=10.0
 
 # Word document
 python-docx>=1.2
+pdf2docx>=0.5
 
 # AI backends
 anthropic>=0.94

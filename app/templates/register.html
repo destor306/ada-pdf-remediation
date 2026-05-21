@@ -3,114 +3,180 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Create Account — ADA PDF Remediation</title>
+  <title>Create account — AccessiFix</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      background: #f0f4f8;
-      min-height: 100vh;
-      display: flex;
+    :root {
+      --blue: #2563EB; --blue-dk: #1D4ED8; --blue-lt: #EFF6FF;
+      --navy: #0F172A; --slate: #1E293B; --gray: #64748B;
+      --border: #E2E8F0; --surface: #F8FAFC; --green: #059669; --green-lt: #ECFDF5;
+    }
+    body { font-family: 'Inter', sans-serif; background: var(--surface); min-height: 100vh; display: flex; }
+
+    .left {
+      display: none;
+      width: 480px;
+      flex-shrink: 0;
+      background: linear-gradient(160deg, #0F172A 0%, #1E3A8A 60%, #1D4ED8 100%);
+      padding: 3rem;
       flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      padding: 2rem 1rem;
-    }
-    .logo { font-size: 1.5rem; font-weight: 700; color: #2b6cb0; margin-bottom: 2rem; text-align: center; }
-    .logo span { color: #4a5568; font-weight: 400; font-size: 0.95rem; display: block; margin-top: 0.25rem; }
-    .card {
-      background: white;
-      border-radius: 12px;
-      box-shadow: 0 2px 12px rgba(0,0,0,0.08);
-      padding: 2rem;
-      width: 100%;
-      max-width: 400px;
-    }
-    h1 { font-size: 1.4rem; color: #1a202c; margin-bottom: 0.4rem; }
-    .subtitle { color: #718096; font-size: 0.88rem; margin-bottom: 1.5rem; }
-    label { display: block; font-size: 0.85rem; font-weight: 500; color: #4a5568; margin-bottom: 0.3rem; }
-    input[type="email"], input[type="password"] {
-      display: block;
-      width: 100%;
-      padding: 0.6rem 0.85rem;
-      border: 1.5px solid #e2e8f0;
-      border-radius: 8px;
-      font-size: 0.95rem;
-      outline: none;
-      transition: border-color 0.15s;
-      margin-bottom: 1rem;
-    }
-    input:focus { border-color: #3182ce; }
-    .btn {
-      display: block;
-      width: 100%;
-      padding: 0.7rem;
-      background: #3182ce;
+      justify-content: space-between;
       color: white;
-      border: none;
-      border-radius: 8px;
-      font-size: 0.95rem;
-      font-weight: 600;
-      cursor: pointer;
-      transition: opacity 0.15s;
-      margin-top: 0.5rem;
     }
-    .btn:hover { opacity: 0.88; }
+    @media (min-width: 900px) { .left { display: flex; } }
+
+    .left-logo { font-size: 1.2rem; font-weight: 800; display: flex; align-items: center; gap: .5rem; }
+    .left-logo span { background: rgba(255,255,255,.15); padding: .15rem .45rem; border-radius: 6px; font-size: .8rem; }
+
+    .left-mid h2 { font-size: 1.9rem; font-weight: 800; line-height: 1.2; letter-spacing: -.02em; margin-bottom: 1rem; }
+    .left-mid h2 em { font-style: normal; background: linear-gradient(90deg, #60A5FA, #A78BFA); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+    .left-mid p { color: #94A3B8; font-size: .95rem; line-height: 1.6; }
+
+    .free-card {
+      background: rgba(255,255,255,.08);
+      border: 1px solid rgba(255,255,255,.12);
+      border-radius: 12px;
+      padding: 1.25rem;
+    }
+    .free-card h3 { font-size: 1rem; font-weight: 700; margin-bottom: .75rem; color: #60A5FA; }
+    .free-card-row { display: flex; align-items: flex-start; gap: .6rem; margin-bottom: .6rem; font-size: .85rem; color: #CBD5E1; }
+    .free-card-row:last-child { margin-bottom: 0; }
+    .free-card-row::before { content: "✓"; color: #4ADE80; font-weight: 700; flex-shrink: 0; }
+
+    .right { flex: 1; display: flex; align-items: center; justify-content: center; padding: 2rem 1.5rem; }
+    .form-card { width: 100%; max-width: 420px; }
+
+    .mobile-logo { display: flex; align-items: center; gap: .5rem; font-size: 1.1rem; font-weight: 800; color: var(--navy); margin-bottom: 2rem; text-decoration: none; }
+    .mobile-logo span { background: var(--blue); color: white; padding: .15rem .4rem; border-radius: 5px; font-size: .75rem; }
+    @media (min-width: 900px) { .mobile-logo { display: none; } }
+
+    .form-card h1 { font-size: 1.6rem; font-weight: 800; color: var(--navy); letter-spacing: -.02em; margin-bottom: .35rem; }
+    .form-card .sub { font-size: .9rem; color: var(--gray); margin-bottom: 1.5rem; }
+    .form-card .sub a { color: var(--blue); text-decoration: none; font-weight: 500; }
+
+    .free-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: .4rem;
+      background: var(--green-lt);
+      color: var(--green);
+      font-size: .8rem;
+      font-weight: 700;
+      padding: .4rem .85rem;
+      border-radius: 99px;
+      margin-bottom: 1.5rem;
+    }
+
     .alert-error {
-      background: #fed7d7;
-      color: #742a2a;
-      padding: 0.7rem 1rem;
+      background: #FEF2F2;
+      border: 1px solid #FECACA;
       border-radius: 8px;
-      font-size: 0.88rem;
-      margin-bottom: 1rem;
-    }
-    .free-note {
-      background: #c6f6d5;
-      color: #276749;
-      padding: 0.6rem 1rem;
-      border-radius: 8px;
-      font-size: 0.85rem;
+      padding: .7rem 1rem;
+      color: #991B1B;
+      font-size: .875rem;
       margin-bottom: 1.25rem;
+      display: flex;
+      align-items: center;
+      gap: .5rem;
     }
-    .footer-link { text-align: center; margin-top: 1.25rem; font-size: 0.88rem; color: #718096; }
-    .footer-link a { color: #3182ce; text-decoration: none; }
-    .back-link { text-align: center; margin-top: 1rem; font-size: 0.85rem; }
-    .back-link a { color: #3182ce; text-decoration: none; }
-    .hint { font-size: 0.78rem; color: #a0aec0; margin-top: -0.7rem; margin-bottom: 1rem; }
+
+    .field { margin-bottom: 1.1rem; }
+    label { display: block; font-size: .82rem; font-weight: 600; color: var(--slate); margin-bottom: .4rem; }
+    input[type="email"], input[type="password"] {
+      display: block; width: 100%; padding: .65rem 1rem;
+      border: 1.5px solid var(--border); border-radius: 9px;
+      font-size: .95rem; font-family: inherit; color: var(--navy);
+      background: white; outline: none;
+      transition: border-color .15s, box-shadow .15s;
+    }
+    input:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgba(37,99,235,.1); }
+    .hint { font-size: .75rem; color: var(--gray); margin-top: .3rem; }
+
+    .btn-submit {
+      display: flex; align-items: center; justify-content: center; gap: .5rem;
+      width: 100%; padding: .75rem;
+      background: var(--blue); color: white; border: none; border-radius: 9px;
+      font-size: .95rem; font-weight: 600; font-family: inherit; cursor: pointer;
+      transition: background .15s, transform .1s, box-shadow .15s;
+    }
+    .btn-submit:hover { background: var(--blue-dk); transform: translateY(-1px); box-shadow: 0 4px 12px rgba(37,99,235,.3); }
+
+    .terms { font-size: .75rem; color: var(--gray); text-align: center; margin-top: 1rem; line-height: 1.5; }
+    .terms a { color: var(--blue); text-decoration: none; }
+
+    .login-cta { text-align: center; margin-top: 1.5rem; font-size: .875rem; color: var(--gray); }
+    .login-cta a { color: var(--blue); text-decoration: none; font-weight: 600; }
+
+    .back-link { text-align: center; margin-top: 1.25rem; font-size: .82rem; }
+    .back-link a { color: var(--gray); text-decoration: none; }
+    .back-link a:hover { color: var(--blue); }
   </style>
 </head>
 <body>
-  <div class="logo">
-    ADA PDF Remediation
-    <span>Create your account</span>
+
+<div class="left">
+  <div class="left-logo">AccessiFix <span>ADA</span></div>
+
+  <div class="left-mid">
+    <h2>ADA compliance made <em>simple</em></h2>
+    <p>Stop worrying about accessibility deadlines. Upload your PDF and get a fully compliant document back in minutes.</p>
   </div>
 
-  <div class="card">
-    <h1>Get started free</h1>
-    <p class="subtitle">3 free pages per month, no credit card required.</p>
+  <div class="free-card">
+    <h3>Free tier includes</h3>
+    <div class="free-card-row">3 pages per month, no credit card required</div>
+    <div class="free-card-row">ADA-compliant PDF + editable .docx output</div>
+    <div class="free-card-row">PAC 2026 compliance pre-check report</div>
+    <div class="free-card-row">Files permanently deleted within 1 hour</div>
+    <div class="free-card-row">Upgrade anytime — cancel anytime</div>
+  </div>
+</div>
 
-    <div class="free-note">Free tier includes 3 pages/month — enough to test your document.</div>
+<div class="right">
+  <div class="form-card">
+    <a href="/" class="mobile-logo">AccessiFix <span>ADA</span></a>
+
+    <h1>Create your account</h1>
+    <p class="sub">Already have an account? <a href="/auth/login">Sign in</a></p>
+
+    <div class="free-pill">
+      <svg width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+      Free — no credit card required
+    </div>
 
     {% if error %}
-    <div class="alert-error">{{ error }}</div>
+    <div class="alert-error">
+      <svg width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z"/></svg>
+      {{ error }}
+    </div>
     {% endif %}
 
     <form method="post" action="/auth/register">
-      <label for="email">Email address</label>
-      <input type="email" id="email" name="email" placeholder="you@example.com" required autofocus />
+      <div class="field">
+        <label for="email">Work email</label>
+        <input type="email" id="email" name="email" placeholder="you@organization.com" required autofocus />
+      </div>
 
-      <label for="password">Password</label>
-      <input type="password" id="password" name="password" placeholder="Min. 8 characters" required minlength="8" />
-      <p class="hint">At least 8 characters</p>
+      <div class="field">
+        <label for="password">Password</label>
+        <input type="password" id="password" name="password" placeholder="Min. 8 characters" required minlength="8" />
+        <p class="hint">At least 8 characters</p>
+      </div>
 
-      <button type="submit" class="btn">Create free account</button>
+      <button type="submit" class="btn-submit">
+        Create free account
+        <svg width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M13.5 4.5L21 12m0 0l-7.5 7.5M21 12H3"/></svg>
+      </button>
     </form>
 
-    <div class="footer-link">
-      Already have an account? <a href="/auth/login">Sign in</a>
-    </div>
-  </div>
+    <p class="terms">By creating an account you agree to our <a href="#">Terms of Service</a> and <a href="#">Privacy Policy</a>.</p>
 
-  <div class="back-link"><a href="/">← Back to home</a></div>
+    <div class="login-cta">Already have an account? <a href="/auth/login">Sign in</a></div>
+    <div class="back-link"><a href="/">← Back to home</a></div>
+  </div>
+</div>
+
 </body>
 </html>

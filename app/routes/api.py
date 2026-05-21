@@ -61,6 +61,8 @@ async def upload_pdf(
     upload_id = str(uuid.uuid4())
     pdf_path = UPLOAD_DIR / f"{upload_id}.pdf"
     pdf_path.write_bytes(content)
+    # Persist original filename so download can use it
+    (UPLOAD_DIR / f"{upload_id}.name").write_text(file.filename, encoding="utf-8")
 
     # Count pages
     try:
@@ -129,6 +131,11 @@ async def process_pdf(
     use_claude   = body.get("use_claude", False)
     notify_email = body.get("email", "").strip()
 
+    # Recover original filename
+    name_file = UPLOAD_DIR / f"{upload_id}.name"
+    original_filename = name_file.read_text(encoding="utf-8").strip() if name_file.exists() else f"{upload_id}.pdf"
+    original_stem = Path(original_filename).stem
+
     # Count pages for billing
     import pdfplumber
     with pdfplumber.open(str(pdf_path)) as pdf:
@@ -136,7 +143,7 @@ async def process_pdf(
 
     # Create job record, attaching user_id when logged in
     output_path = str(OUTPUT_DIR / f"{upload_id}_accessible.docx")
-    job = create_job(str(pdf_path), output_path, use_claude=use_claude, notify_email=notify_email, user_id=user.id if user else None)
+    job = create_job(str(pdf_path), output_path, use_claude=use_claude, notify_email=notify_email, user_id=user.id if user else None, original_stem=original_stem)
 
     billing = calculate_charge(page_count)
 
@@ -226,23 +233,23 @@ async def download_result(job_id: str, fmt: str = "pdf", user: User | None = Dep
     if job.status != "done":
         raise HTTPException(400, f"Job not complete (status: {job.status})")
 
+    stem = getattr(job, "original_stem", None) or Path(job.pdf_path).stem
+
     # Prefer PDF output
     if fmt != "docx" and getattr(job, "output_pdf", None) and Path(job.output_pdf).exists():
-        filename = Path(job.pdf_path).stem + "_ada_compliant.pdf"
         return FileResponse(
             path=job.output_pdf,
             media_type="application/pdf",
-            filename=filename,
+            filename=f"{stem}_accessible.pdf",
         )
 
     # Fall back to docx
     if not Path(job.output_path).exists():
         raise HTTPException(500, "Output file missing")
-    filename = Path(job.output_path).name
     return FileResponse(
         path=job.output_path,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        filename=filename,
+        filename=f"{stem}_accessible.docx",
     )
 
 
