@@ -2,6 +2,10 @@
 Auth routes: register, login, logout.
 """
 
+import os
+import time
+import threading
+from collections import defaultdict
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, Form, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -19,10 +23,41 @@ from app.auth import (
 router = APIRouter(prefix="/auth")
 templates = Jinja2Templates(directory=str(Path(__file__).parent.parent / "templates"))
 
+IS_PROD = os.environ.get("ENV", "development").lower() == "production"
+
+# ── Login brute-force protection ─────────────────────────────────────────────
+# Max 10 failed attempts per IP per 15-minute window
+_login_attempts: dict[str, list[float]] = defaultdict(list)
+_login_lock = threading.Lock()
+_MAX_ATTEMPTS = 10
+_WINDOW_SEC   = 900  # 15 minutes
+
+
+def _check_login_rate(ip: str) -> bool:
+    """Returns True if the IP is allowed to attempt login."""
+    now = time.time()
+    cutoff = now - _WINDOW_SEC
+    with _login_lock:
+        attempts = [t for t in _login_attempts[ip] if t > cutoff]
+        _login_attempts[ip] = attempts
+        return len(attempts) < _MAX_ATTEMPTS
+
+
+def _record_failed_login(ip: str):
+    now = time.time()
+    with _login_lock:
+        _login_attempts[ip].append(now)
+
 
 def _set_session(response, user_id: int):
     token = create_token(user_id)
-    response.set_cookie("session", token, httponly=True, samesite="lax", max_age=60 * 60 * 24 * 30)
+    response.set_cookie(
+        "session", token,
+        httponly=True,
+        samesite="lax",
+        secure=IS_PROD,   # HTTPS-only in production
+        max_age=60 * 60 * 24 * 30,
+    )
 
 
 @router.get("/register", response_class=HTMLResponse)
@@ -40,9 +75,15 @@ async def register(
     db: Session = Depends(get_db),
 ):
     email = email.strip().lower()
+    if len(email) > 254:
+        return templates.TemplateResponse(request, "register.html",
+            {"request": request, "error": "Invalid email address."}, status_code=400)
     if len(password) < 8:
         return templates.TemplateResponse(request, "register.html",
             {"request": request, "error": "Password must be at least 8 characters."}, status_code=400)
+    if len(password) > 1024:
+        return templates.TemplateResponse(request, "register.html",
+            {"request": request, "error": "Password too long."}, status_code=400)
 
     existing = db.query(User).filter(User.email == email).first()
     if existing:
@@ -74,10 +115,22 @@ async def login(
     next: str = Form(default="/dashboard"),
     db: Session = Depends(get_db),
 ):
+    ip = request.client.host if request.client else "unknown"
+
+    if not _check_login_rate(ip):
+        return templates.TemplateResponse(request, "login.html",
+            {"request": request, "error": "Too many login attempts. Please wait 15 minutes.", "next": next},
+            status_code=429)
+
     email = email.strip().lower()
+    if len(email) > 254 or len(password) > 1024:
+        return templates.TemplateResponse(request, "login.html",
+            {"request": request, "error": "Invalid email or password.", "next": next}, status_code=401)
+
     user = db.query(User).filter(User.email == email).first()
 
     if not user or not verify_password(password, user.password_hash):
+        _record_failed_login(ip)
         return templates.TemplateResponse(request, "login.html",
             {"request": request, "error": "Invalid email or password.", "next": next}, status_code=401)
 

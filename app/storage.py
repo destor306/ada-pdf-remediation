@@ -21,10 +21,11 @@ def cleanup():
         if now - path.stat().st_mtime > UPLOAD_TTL:
             path.unlink(missing_ok=True)
             removed += 1
-    for path in OUTPUT_DIR.glob("*.docx"):
-        if now - path.stat().st_mtime > OUTPUT_TTL:
-            path.unlink(missing_ok=True)
-            removed += 1
+    for pattern in ("*.docx", "*.pdf"):
+        for path in OUTPUT_DIR.glob(pattern):
+            if now - path.stat().st_mtime > OUTPUT_TTL:
+                path.unlink(missing_ok=True)
+                removed += 1
     return removed
 
 

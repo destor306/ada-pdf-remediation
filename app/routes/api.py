@@ -47,6 +47,10 @@ async def upload_pdf(request: Request, file: UploadFile = File(...)):
     if mb > MAX_UPLOAD_MB:
         raise HTTPException(413, f"File too large ({mb:.1f} MB). Max {MAX_UPLOAD_MB} MB.")
 
+    # Magic byte check — real PDFs start with %PDF
+    if not content[:5].startswith(b"%PDF-"):
+        raise HTTPException(400, "File does not appear to be a valid PDF.")
+
     # Save upload
     upload_id = str(uuid.uuid4())
     pdf_path = UPLOAD_DIR / f"{upload_id}.pdf"
