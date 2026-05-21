@@ -18,13 +18,14 @@ JobStatus = Literal["queued", "running", "done", "failed"]
 
 
 class Job:
-    def __init__(self, job_id: str, pdf_path: str, output_path: str, use_claude: bool = False, notify_email: str = ""):
+    def __init__(self, job_id: str, pdf_path: str, output_path: str, use_claude: bool = False, notify_email: str = "", user_id: int | None = None):
         self.id           = job_id
         self.pdf_path     = pdf_path
         self.output_path  = output_path          # .docx (intermediate)
         self.output_pdf   = output_path.replace(".docx", "_ada.pdf")  # final output
         self.use_claude   = use_claude
         self.notify_email = notify_email
+        self.user_id      = user_id
         self.status: JobStatus = "queued"
         self.progress     = 0
         self.current_page = 0
@@ -125,6 +126,25 @@ def _execute(job: Job):
         job.status      = "done"
         job.completed_at = _now()
 
+        if job.user_id:
+            try:
+                from app.database import SessionLocal
+                from app.models import User
+                from app.auth import current_month
+                db = SessionLocal()
+                user = db.get(User, job.user_id)
+                if user:
+                    month = current_month()
+                    if user.usage_month != month:
+                        user.pages_used = 0
+                        user.usage_month = month
+                    user.pages_used = (user.pages_used or 0) + job.total_pages
+                    db.commit()
+            except Exception:
+                pass
+            finally:
+                db.close()
+
         if job.notify_email:
             from app.email_notify import notify_done
             from app.config import APP_URL
@@ -140,8 +160,8 @@ def _execute(job: Job):
             notify_failed(job.notify_email, job.id)
 
 
-def create_job(pdf_path: str, output_path: str, use_claude: bool = False, notify_email: str = "") -> Job:
-    job = Job(str(uuid.uuid4()), pdf_path, output_path, use_claude, notify_email)
+def create_job(pdf_path: str, output_path: str, use_claude: bool = False, notify_email: str = "", user_id: int | None = None) -> Job:
+    job = Job(str(uuid.uuid4()), pdf_path, output_path, use_claude, notify_email, user_id)
     _store(job)
     return job
 

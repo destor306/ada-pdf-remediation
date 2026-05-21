@@ -26,6 +26,7 @@ pillow>=10.0
 
 # Auth / database
 sqlalchemy>=2.0
+psycopg2-binary>=2.9
 bcrypt>=4.0
 python-jose[cryptography]>=3.3
 itsdangerous>=2.1

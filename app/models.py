@@ -33,5 +33,8 @@ class User(Base):
     pages_used          = Column(Integer, default=0)
     usage_month         = Column(String, default="")  # "2026-05" format
 
+    reset_token         = Column(String, nullable=True, index=True)
+    reset_token_exp     = Column(DateTime, nullable=True)
+
     created_at          = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     last_login          = Column(DateTime, nullable=True)

@@ -21,6 +21,7 @@ from app.billing import calculate_charge, create_checkout_session
 from app.ratelimit import check_free_tier, consume_free_pages, get_usage
 from app.database import get_db
 from app.auth import get_current_user, pages_remaining, can_process_free
+from app.models import User
 
 router = APIRouter(prefix="/api")
 
@@ -33,7 +34,12 @@ async def usage_route(request: Request):
 
 
 @router.post("/upload")
-async def upload_pdf(request: Request, file: UploadFile = File(...)):
+async def upload_pdf(
+    request: Request,
+    file: UploadFile = File(...),
+    user: User | None = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     """
     Accept a PDF upload, return page count and cost estimate.
     Does NOT start processing yet.
@@ -70,6 +76,16 @@ async def upload_pdf(request: Request, file: UploadFile = File(...)):
         raise HTTPException(400, f"Document has {page_count} pages. Max allowed: {MAX_PAGES_HARD}.")
 
     billing = calculate_charge(page_count)
+
+    # Plan-aware billing for logged-in users
+    if user:
+        plan = user.plan.value
+        if plan in ("free", "pro", "business"):
+            remaining = pages_remaining(user, db)
+            if remaining is not None and remaining >= page_count:
+                billing = dict(billing, requires_payment=False, amount_usd=0)
+        # payg always uses calculate_charge (charges for all pages)
+
     requires_confirmation = page_count > LARGE_DOC_THRESHOLD
     ip = request.client.host if request.client else "unknown"
     usage = get_usage(ip)
@@ -89,7 +105,12 @@ async def upload_pdf(request: Request, file: UploadFile = File(...)):
 
 
 @router.post("/process")
-async def process_pdf(body: dict):
+async def process_pdf(
+    request: Request,
+    body: dict,
+    user: User | None = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     """
     Start processing a previously uploaded PDF.
     Body: { "upload_id": "...", "use_claude": false, "confirmed": true }
@@ -113,11 +134,26 @@ async def process_pdf(body: dict):
     with pdfplumber.open(str(pdf_path)) as pdf:
         page_count = len(pdf.pages)
 
-    # Create job record
+    # Create job record, attaching user_id when logged in
     output_path = str(OUTPUT_DIR / f"{upload_id}_accessible.docx")
-    job = create_job(str(pdf_path), output_path, use_claude=use_claude, notify_email=notify_email)
+    job = create_job(str(pdf_path), output_path, use_claude=use_claude, notify_email=notify_email, user_id=user.id if user else None)
 
     billing = calculate_charge(page_count)
+
+    # Plan-aware billing: skip payment for users with included pages
+    if user:
+        plan = user.plan.value
+        if plan in ("free", "pro", "business"):
+            remaining = pages_remaining(user, db)
+            if remaining is not None and remaining >= page_count:
+                # Covered by subscription/free plan — start immediately
+                start_job(job)
+                return {
+                    "job_id": job.id,
+                    "status": "queued",
+                    "billing": dict(billing, requires_payment=False, amount_usd=0),
+                }
+        # payg or insufficient remaining pages — fall through to Stripe
 
     # If payment required, create Stripe session
     if billing["requires_payment"]:
@@ -140,11 +176,15 @@ async def process_pdf(body: dict):
 
 
 @router.get("/status/{job_id}")
-async def job_status(job_id: str):
+async def job_status(job_id: str, user: User | None = Depends(get_current_user)):
     """Poll job status and progress."""
     job = get_job(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
+
+    # Ownership check: logged-in users can only access their own jobs (or anonymous jobs)
+    if user and job.user_id is not None and job.user_id != user.id:
+        raise HTTPException(403, "Access denied")
 
     backend_labels = {
         "ollama": "Local AI (Ollama)",
@@ -169,7 +209,7 @@ async def job_status(job_id: str):
 
 
 @router.get("/download/{job_id}")
-async def download_result(job_id: str, fmt: str = "pdf"):
+async def download_result(job_id: str, fmt: str = "pdf", user: User | None = Depends(get_current_user)):
     """
     Download completed output.
     fmt=pdf  → ADA-compliant PDF (default)
@@ -178,6 +218,11 @@ async def download_result(job_id: str, fmt: str = "pdf"):
     job = get_job(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
+
+    # Ownership check: logged-in users can only access their own jobs (or anonymous jobs)
+    if user and job.user_id is not None and job.user_id != user.id:
+        raise HTTPException(403, "Access denied")
+
     if job.status != "done":
         raise HTTPException(400, f"Job not complete (status: {job.status})")
 

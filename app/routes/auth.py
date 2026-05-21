@@ -149,6 +149,63 @@ async def logout():
     return response
 
 
+@router.get("/forgot-password", response_class=HTMLResponse)
+async def forgot_password_page(request: Request):
+    return templates.TemplateResponse(request, "forgot_password.html", {"request": request, "sent": False, "error": None})
+
+
+@router.post("/forgot-password", response_class=HTMLResponse)
+async def forgot_password(request: Request, email: str = Form(...), db: Session = Depends(get_db)):
+    import secrets as _secrets
+    from datetime import timedelta
+    email = email.strip().lower()
+    user = db.query(User).filter(User.email == email).first()
+    if user:
+        token = _secrets.token_urlsafe(32)
+        user.reset_token = token
+        user.reset_token_exp = datetime.now(timezone.utc) + timedelta(hours=1)
+        db.commit()
+        # Send email
+        from app.config import APP_URL
+        from app.email_notify import _send
+        reset_url = f"{APP_URL}/auth/reset-password?token={token}"
+        _send(email, "Reset your AccessiFix password",
+            f'<div style="font-family:sans-serif;max-width:520px;margin:0 auto;padding:2rem">'
+            f'<h2 style="color:#2563EB">Reset your password</h2>'
+            f'<p>Click the link below to set a new password. This link expires in 1 hour.</p>'
+            f'<p style="margin:1.5rem 0"><a href="{reset_url}" style="background:#2563EB;color:white;'
+            f'padding:.7rem 1.4rem;border-radius:8px;text-decoration:none;font-weight:600">Reset Password</a></p>'
+            f'<p style="color:#64748B;font-size:.85rem">If you didn\'t request this, you can safely ignore it.</p></div>')
+    # Always show "sent" to prevent email enumeration
+    return templates.TemplateResponse(request, "forgot_password.html", {"request": request, "sent": True, "error": None})
+
+
+@router.get("/reset-password", response_class=HTMLResponse)
+async def reset_password_page(request: Request, token: str = "", db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.reset_token == token).first()
+    if not user or not user.reset_token_exp or user.reset_token_exp < datetime.now(timezone.utc):
+        return templates.TemplateResponse(request, "forgot_password.html",
+            {"request": request, "sent": False, "error": "This reset link has expired or is invalid. Please request a new one."})
+    return templates.TemplateResponse(request, "reset_password.html", {"request": request, "token": token, "error": None})
+
+
+@router.post("/reset-password", response_class=HTMLResponse)
+async def reset_password(request: Request, token: str = Form(...), password: str = Form(...), db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.reset_token == token).first()
+    if not user or not user.reset_token_exp or user.reset_token_exp < datetime.now(timezone.utc):
+        return templates.TemplateResponse(request, "forgot_password.html",
+            {"request": request, "sent": False, "error": "This reset link has expired. Please request a new one."})
+    if len(password) < 8:
+        return templates.TemplateResponse(request, "reset_password.html",
+            {"request": request, "token": token, "error": "Password must be at least 8 characters."})
+    user.password_hash = hash_password(password)
+    user.reset_token = None
+    user.reset_token_exp = None
+    db.commit()
+    response = RedirectResponse("/auth/login?reset=1", status_code=302)
+    return response
+
+
 @router.get("/dashboard", response_class=HTMLResponse)
 async def dashboard(request: Request, db: Session = Depends(get_db), user=Depends(get_current_user)):
     if not user:
