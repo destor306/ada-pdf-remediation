@@ -54,7 +54,7 @@ CLAUDE_COST_PER_PAGE = 0.025     # ~$0.02–0.03 estimate
 LOCAL_COST_PER_PAGE = 0.0        # free
 
 LOCAL_MODEL = os.environ.get("LOCAL_MODEL", "qwen2-vl:2b")
-CLAUDE_MODEL = "claude-sonnet-4-6"
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 
 # Poppler path (Windows — set via env or auto-detected)

@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Create Account — ADA PDF Remediation</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #f0f4f8;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 2rem 1rem;
+    }
+    .logo { font-size: 1.5rem; font-weight: 700; color: #2b6cb0; margin-bottom: 2rem; text-align: center; }
+    .logo span { color: #4a5568; font-weight: 400; font-size: 0.95rem; display: block; margin-top: 0.25rem; }
+    .card {
+      background: white;
+      border-radius: 12px;
+      box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+      padding: 2rem;
+      width: 100%;
+      max-width: 400px;
+    }
+    h1 { font-size: 1.4rem; color: #1a202c; margin-bottom: 0.4rem; }
+    .subtitle { color: #718096; font-size: 0.88rem; margin-bottom: 1.5rem; }
+    label { display: block; font-size: 0.85rem; font-weight: 500; color: #4a5568; margin-bottom: 0.3rem; }
+    input[type="email"], input[type="password"] {
+      display: block;
+      width: 100%;
+      padding: 0.6rem 0.85rem;
+      border: 1.5px solid #e2e8f0;
+      border-radius: 8px;
+      font-size: 0.95rem;
+      outline: none;
+      transition: border-color 0.15s;
+      margin-bottom: 1rem;
+    }
+    input:focus { border-color: #3182ce; }
+    .btn {
+      display: block;
+      width: 100%;
+      padding: 0.7rem;
+      background: #3182ce;
+      color: white;
+      border: none;
+      border-radius: 8px;
+      font-size: 0.95rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity 0.15s;
+      margin-top: 0.5rem;
+    }
+    .btn:hover { opacity: 0.88; }
+    .alert-error {
+      background: #fed7d7;
+      color: #742a2a;
+      padding: 0.7rem 1rem;
+      border-radius: 8px;
+      font-size: 0.88rem;
+      margin-bottom: 1rem;
+    }
+    .free-note {
+      background: #c6f6d5;
+      color: #276749;
+      padding: 0.6rem 1rem;
+      border-radius: 8px;
+      font-size: 0.85rem;
+      margin-bottom: 1.25rem;
+    }
+    .footer-link { text-align: center; margin-top: 1.25rem; font-size: 0.88rem; color: #718096; }
+    .footer-link a { color: #3182ce; text-decoration: none; }
+    .back-link { text-align: center; margin-top: 1rem; font-size: 0.85rem; }
+    .back-link a { color: #3182ce; text-decoration: none; }
+    .hint { font-size: 0.78rem; color: #a0aec0; margin-top: -0.7rem; margin-bottom: 1rem; }
+  </style>
+</head>
+<body>
+  <div class="logo">
+    ADA PDF Remediation
+    <span>Create your account</span>
+  </div>
+
+  <div class="card">
+    <h1>Get started free</h1>
+    <p class="subtitle">3 free pages per month, no credit card required.</p>
+
+    <div class="free-note">Free tier includes 3 pages/month — enough to test your document.</div>
+
+    {% if error %}
+    <div class="alert-error">{{ error }}</div>
+    {% endif %}
+
+    <form method="post" action="/auth/register">
+      <label for="email">Email address</label>
+      <input type="email" id="email" name="email" placeholder="you@example.com" required autofocus />
+
+      <label for="password">Password</label>
+      <input type="password" id="password" name="password" placeholder="Min. 8 characters" required minlength="8" />
+      <p class="hint">At least 8 characters</p>
+
+      <button type="submit" class="btn">Create free account</button>
+    </form>
+
+    <div class="footer-link">
+      Already have an account? <a href="/auth/login">Sign in</a>
+    </div>
+  </div>
+
+  <div class="back-link"><a href="/">← Back to home</a></div>
+</body>
+</html>

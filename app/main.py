@@ -8,8 +8,10 @@ from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 
 from app.billing import init_stripe
+from app.database import init_db
 from app.storage import start_cleanup_thread
 from app.routes.api import router as api_router
+from app.routes.auth import router as auth_router
 from app.routes.billing import router as billing_router
 from app.routes.pages import router as pages_router
 from app.routes.admin import router as admin_router
@@ -17,6 +19,7 @@ from app.routes.admin import router as admin_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    init_db()
     init_stripe()
     start_cleanup_thread()
     print("ADA Remediation API started.")
@@ -37,6 +40,7 @@ app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
 # Routers
 app.include_router(pages_router)
+app.include_router(auth_router)
 app.include_router(api_router)
 app.include_router(billing_router)
 app.include_router(admin_router)

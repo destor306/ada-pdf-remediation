@@ -7,16 +7,20 @@ import shutil
 import uuid
 from pathlib import Path
 
-from fastapi import APIRouter, File, HTTPException, UploadFile, Request
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, Request
 from fastapi.responses import FileResponse, JSONResponse
+from sqlalchemy.orm import Session
 
 from app.config import (
     UPLOAD_DIR, OUTPUT_DIR, MAX_UPLOAD_MB, MAX_PAGES_HARD,
-    FREE_PAGES_PER_MONTH, PRICE_PER_PAGE, LARGE_DOC_THRESHOLD
+    FREE_PAGES_PER_MONTH, PRICE_PER_PAGE, LARGE_DOC_THRESHOLD,
+    STRIPE_SECRET_KEY, APP_URL,
 )
 from app.jobs import create_job, get_job, start_job
 from app.billing import calculate_charge, create_checkout_session
 from app.ratelimit import check_free_tier, consume_free_pages, get_usage
+from app.database import get_db
+from app.auth import get_current_user, pages_remaining, can_process_free
 
 router = APIRouter(prefix="/api")
 
@@ -228,3 +232,64 @@ async def check_compliance(body: dict):
         return result
     except Exception as e:
         raise HTTPException(500, f"Check failed: {e}")
+
+
+# Stripe price IDs — set these in .env after creating products in Stripe dashboard
+STRIPE_PRICE_IDS = {
+    "pro":      os.environ.get("STRIPE_PRICE_PRO", ""),
+    "business": os.environ.get("STRIPE_PRICE_BUSINESS", ""),
+}
+
+
+@router.post("/subscribe")
+async def create_subscription(
+    body: dict,
+    request: Request,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    """
+    Start a Stripe Checkout session for a monthly subscription plan,
+    or switch user to payg/free (no payment needed).
+    Body: { "plan": "free" | "payg" | "pro" | "business" }
+    """
+    if not user:
+        raise HTTPException(401, "Login required")
+
+    plan = body.get("plan", "")
+    if plan not in ("free", "payg", "pro", "business"):
+        raise HTTPException(400, "Invalid plan")
+
+    # free / payg — no Stripe session needed, just update the record
+    if plan in ("free", "payg"):
+        from app.models import PlanTier
+        user.plan = PlanTier(plan)
+        db.commit()
+        return {"message": f"Switched to {plan} plan."}
+
+    # pro / business — create Stripe Checkout subscription session
+    price_id = STRIPE_PRICE_IDS.get(plan)
+    if not price_id or not STRIPE_SECRET_KEY:
+        raise HTTPException(503, "Stripe not configured for subscriptions. Contact support.")
+
+    import stripe
+    stripe.api_key = STRIPE_SECRET_KEY
+
+    # Reuse existing Stripe customer if available
+    customer_id = user.stripe_customer_id
+    if not customer_id:
+        customer = stripe.Customer.create(email=user.email, metadata={"user_id": user.id})
+        customer_id = customer.id
+        user.stripe_customer_id = customer_id
+        db.commit()
+
+    session = stripe.checkout.Session.create(
+        customer=customer_id,
+        payment_method_types=["card"],
+        line_items=[{"price": price_id, "quantity": 1}],
+        mode="subscription",
+        success_url=f"{APP_URL}/billing/sub-success?plan={plan}",
+        cancel_url=f"{APP_URL}/auth/dashboard",
+        metadata={"user_id": user.id, "plan": plan},
+    )
+    return {"checkout_url": session.url}

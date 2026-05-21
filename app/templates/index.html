@@ -18,6 +18,29 @@
       padding: 2rem 1rem;
     }
 
+    nav {
+      width: 100%;
+      max-width: 680px;
+      display: flex;
+      justify-content: flex-end;
+      gap: 1rem;
+      margin-bottom: 1rem;
+    }
+    nav a {
+      font-size: 0.875rem;
+      color: #4a5568;
+      text-decoration: none;
+      padding: 0.35rem 0.85rem;
+      border-radius: 6px;
+      border: 1.5px solid #e2e8f0;
+      background: white;
+      font-weight: 500;
+      transition: border-color 0.15s;
+    }
+    nav a:hover { border-color: #3182ce; color: #3182ce; }
+    nav a.primary { background: #3182ce; color: white; border-color: #3182ce; }
+    nav a.primary:hover { opacity: 0.88; }
+
     header {
       text-align: center;
       margin-bottom: 2rem;
@@ -178,6 +201,16 @@
   </style>
 </head>
 <body>
+
+<nav>
+  {% if user %}
+    <a href="/auth/dashboard">My Account</a>
+    <a href="/auth/logout">Sign out</a>
+  {% else %}
+    <a href="/auth/login">Sign in</a>
+    <a href="/auth/register" class="primary">Get started free</a>
+  {% endif %}
+</nav>
 
 <header>
   <h1>ADA PDF Remediation</h1>

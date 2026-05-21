@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Dashboard — ADA PDF Remediation</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #f0f4f8;
+      min-height: 100vh;
+      padding: 2rem 1rem;
+    }
+    nav {
+      max-width: 800px;
+      margin: 0 auto 2rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .nav-logo { font-size: 1.2rem; font-weight: 700; color: #2b6cb0; text-decoration: none; }
+    .nav-links a {
+      color: #4a5568;
+      text-decoration: none;
+      font-size: 0.9rem;
+      margin-left: 1.5rem;
+    }
+    .nav-links a:hover { color: #2b6cb0; }
+    .container { max-width: 800px; margin: 0 auto; }
+    h1 { font-size: 1.7rem; color: #1a202c; margin-bottom: 0.3rem; }
+    .subtitle { color: #718096; font-size: 0.9rem; margin-bottom: 2rem; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; margin-bottom: 1.5rem; }
+    @media (max-width: 600px) { .grid { grid-template-columns: 1fr; } }
+    .card {
+      background: white;
+      border-radius: 12px;
+      box-shadow: 0 2px 12px rgba(0,0,0,0.07);
+      padding: 1.5rem;
+    }
+    .card h2 { font-size: 1rem; color: #4a5568; font-weight: 500; margin-bottom: 1rem; }
+    .stat-big { font-size: 2.5rem; font-weight: 800; color: #2b6cb0; }
+    .stat-label { font-size: 0.82rem; color: #a0aec0; margin-top: 0.2rem; }
+
+    .plan-badge {
+      display: inline-block;
+      padding: 0.25rem 0.7rem;
+      border-radius: 99px;
+      font-size: 0.78rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .plan-free     { background: #e2e8f0; color: #4a5568; }
+    .plan-payg     { background: #ebf8ff; color: #2b6cb0; }
+    .plan-pro      { background: #d6f5e9; color: #276749; }
+    .plan-business { background: #fef3c7; color: #92400e; }
+
+    .usage-bar-bg {
+      background: #e2e8f0;
+      border-radius: 99px;
+      height: 8px;
+      overflow: hidden;
+      margin: 0.75rem 0;
+    }
+    .usage-bar-fill {
+      background: #3182ce;
+      height: 100%;
+      border-radius: 99px;
+      transition: width 0.4s;
+    }
+    .usage-bar-fill.warn { background: #e53e3e; }
+
+    .btn {
+      display: inline-block;
+      padding: 0.55rem 1.2rem;
+      border-radius: 8px;
+      font-weight: 600;
+      font-size: 0.88rem;
+      cursor: pointer;
+      border: none;
+      text-decoration: none;
+      transition: opacity 0.15s;
+    }
+    .btn:hover { opacity: 0.87; }
+    .btn-primary { background: #3182ce; color: white; }
+    .btn-outline { background: white; color: #3182ce; border: 1.5px solid #3182ce; }
+    .btn-danger  { background: white; color: #e53e3e; border: 1.5px solid #e53e3e; }
+
+    .plan-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 0.75rem; margin-top: 1rem; }
+    .plan-card {
+      border: 1.5px solid #e2e8f0;
+      border-radius: 10px;
+      padding: 1rem 0.75rem;
+      text-align: center;
+    }
+    .plan-card.current { border-color: #3182ce; background: #ebf8ff; }
+    .plan-card .name { font-weight: 700; font-size: 0.9rem; color: #2d3748; }
+    .plan-card .price { font-size: 1.3rem; font-weight: 800; color: #3182ce; margin: 0.25rem 0; }
+    .plan-card .desc { font-size: 0.75rem; color: #718096; }
+    .plan-card .select-btn { margin-top: 0.75rem; display: block; width: 100%; padding: 0.4rem; font-size: 0.8rem; font-weight: 600; border-radius: 6px; cursor: pointer; border: 1.5px solid #3182ce; background: white; color: #3182ce; }
+    .plan-card.current .select-btn { background: #3182ce; color: white; cursor: default; }
+    .plan-card .select-btn:hover:not(:disabled) { background: #ebf8ff; }
+
+    .info-row { display: flex; justify-content: space-between; align-items: center; padding: 0.6rem 0; border-bottom: 1px solid #f0f4f8; font-size: 0.88rem; }
+    .info-row:last-child { border-bottom: none; }
+    .info-row .label { color: #718096; }
+    .info-row .value { font-weight: 500; color: #2d3748; }
+
+    .action-card { display: flex; gap: 1rem; flex-wrap: wrap; align-items: center; }
+
+    .alert { padding: 0.75rem 1rem; border-radius: 8px; font-size: 0.88rem; margin-bottom: 1rem; }
+    .alert-success { background: #c6f6d5; color: #276749; }
+    .alert-info    { background: #ebf8ff; color: #2c5282; }
+  </style>
+</head>
+<body>
+
+<nav>
+  <a href="/" class="nav-logo">ADA PDF Remediation</a>
+  <div class="nav-links">
+    <a href="/">Upload PDF</a>
+    <a href="/auth/logout">Sign out</a>
+  </div>
+</nav>
+
+<div class="container">
+  <h1>Welcome back</h1>
+  <p class="subtitle">{{ user.email }}</p>
+
+  <div class="grid">
+
+    <!-- Usage card -->
+    <div class="card">
+      <h2>This month's usage</h2>
+      {% if pages_remaining is none %}
+        <div class="stat-big">&#8734;</div>
+        <div class="stat-label">Unlimited pages (Pay-as-you-go)</div>
+      {% else %}
+        <div class="stat-big">{{ pages_remaining }}</div>
+        <div class="stat-label">pages remaining</div>
+        {% set limit = {"free": 3, "pro": 200, "business": 1000}.get(user.plan.value, 3) %}
+        {% set pct = ((pages_used / limit) * 100) | int if limit > 0 else 0 %}
+        <div class="usage-bar-bg">
+          <div class="usage-bar-fill {% if pct >= 90 %}warn{% endif %}" style="width: {{ [pct, 100] | min }}%"></div>
+        </div>
+        <div style="font-size:0.8rem;color:#718096;">{{ pages_used }} of {{ limit }} used</div>
+      {% endif %}
+    </div>
+
+    <!-- Plan card -->
+    <div class="card">
+      <h2>Your plan</h2>
+      <span class="plan-badge plan-{{ user.plan.value }}">{{ user.plan.value | upper }}</span>
+      <div style="margin-top:1rem;">
+        <div class="info-row">
+          <span class="label">Account</span>
+          <span class="value">{{ user.email }}</span>
+        </div>
+        {% if user.stripe_sub_id %}
+        <div class="info-row">
+          <span class="label">Subscription</span>
+          <span class="value" style="color:#38a169;">Active</span>
+        </div>
+        {% endif %}
+      </div>
+    </div>
+
+  </div>
+
+  <!-- Upgrade card -->
+  <div class="card" style="margin-bottom:1.5rem;">
+    <h2>Upgrade plan</h2>
+    <div class="plan-cards">
+
+      <div class="plan-card {% if user.plan.value == 'free' %}current{% endif %}">
+        <div class="name">Free</div>
+        <div class="price">$0</div>
+        <div class="desc">3 pages/month</div>
+        <button class="select-btn" {% if user.plan.value == 'free' %}disabled{% else %}onclick="subscribe('free')"{% endif %}>
+          {% if user.plan.value == 'free' %}Current plan{% else %}Downgrade{% endif %}
+        </button>
+      </div>
+
+      <div class="plan-card {% if user.plan.value == 'payg' %}current{% endif %}">
+        <div class="name">Pay-as-you-go</div>
+        <div class="price">$0.05<span style="font-size:.75rem;font-weight:400;">/page</span></div>
+        <div class="desc">No commitment</div>
+        <button class="select-btn" {% if user.plan.value == 'payg' %}disabled{% else %}onclick="subscribe('payg')"{% endif %}>
+          {% if user.plan.value == 'payg' %}Current plan{% else %}Select{% endif %}
+        </button>
+      </div>
+
+      <div class="plan-card {% if user.plan.value == 'pro' %}current{% endif %}">
+        <div class="name">Pro</div>
+        <div class="price">$19<span style="font-size:.75rem;font-weight:400;">/mo</span></div>
+        <div class="desc">200 pages/month</div>
+        <button class="select-btn" {% if user.plan.value == 'pro' %}disabled{% else %}onclick="subscribe('pro')"{% endif %}>
+          {% if user.plan.value == 'pro' %}Current plan{% else %}Upgrade{% endif %}
+        </button>
+      </div>
+
+      <div class="plan-card {% if user.plan.value == 'business' %}current{% endif %}">
+        <div class="name">Business</div>
+        <div class="price">$79<span style="font-size:.75rem;font-weight:400;">/mo</span></div>
+        <div class="desc">1,000 pages/month</div>
+        <button class="select-btn" {% if user.plan.value == 'business' %}disabled{% else %}onclick="subscribe('business')"{% endif %}>
+          {% if user.plan.value == 'business' %}Current plan{% else %}Upgrade{% endif %}
+        </button>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- Quick actions -->
+  <div class="card action-card">
+    <a href="/" class="btn btn-primary">Upload a PDF</a>
+    <a href="/auth/logout" class="btn btn-outline">Sign out</a>
+  </div>
+
+</div>
+
+<script>
+async function subscribe(plan) {
+  const res = await fetch('/api/subscribe', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ plan }),
+  });
+  const data = await res.json();
+  if (data.checkout_url) {
+    window.location.href = data.checkout_url;
+  } else if (data.message) {
+    alert(data.message);
+    window.location.reload();
+  } else {
+    alert('Something went wrong. Please try again.');
+  }
+}
+</script>
+
+</body>
+</html>
