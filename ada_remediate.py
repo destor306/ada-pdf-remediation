@@ -296,14 +296,44 @@ def user_message_text(page_num: int, text_hint: str, image_count: int = 0) -> st
 
 
 def parse_json_response(raw: str, page_num: int) -> dict:
-    """Strip markdown fences and parse JSON."""
+    """Strip markdown fences and parse JSON, recovering partial elements on truncation."""
     raw = re.sub(r"^```[a-z]*\n?", "", raw, flags=re.MULTILINE)
     raw = re.sub(r"```\s*$", "", raw, flags=re.MULTILINE).strip()
     try:
         return json.loads(raw)
     except json.JSONDecodeError as e:
-        print(f"  [warn] JSON parse error on page {page_num}: {e}")
+        print(f"  [warn] JSON parse error on page {page_num}: {e} — attempting partial recovery")
+        return _recover_partial_elements(raw, page_num)
+
+
+def _recover_partial_elements(raw: str, page_num: int) -> dict:
+    """Extract complete JSON objects from a truncated elements array."""
+    m = re.search(r'"elements"\s*:\s*\[', raw)
+    if not m:
         return {"page": page_num, "elements": []}
+    elements = []
+    pos = m.end()
+    depth = 0
+    obj_start = None
+    for i in range(pos, len(raw)):
+        ch = raw[i]
+        if ch == '{':
+            if depth == 0:
+                obj_start = i
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0 and obj_start is not None:
+                try:
+                    elements.append(json.loads(raw[obj_start:i + 1]))
+                except json.JSONDecodeError:
+                    pass
+                obj_start = None
+        elif ch == ']' and depth == 0:
+            break
+    if elements:
+        print(f"  [info] Recovered {len(elements)} element(s) from truncated page {page_num}")
+    return {"page": page_num, "elements": elements}
 
 
 # ---------------------------------------------------------------------------
@@ -387,7 +417,104 @@ def analyze_with_claude(pdf_path: str, page_num: int, text_hint: str = "", image
 
 
 # ---------------------------------------------------------------------------
-# Mock backend (no AI — uses pdfplumber text extraction)
+# Zero-cost text-only analyzer (font-size aware, no AI)
+# ---------------------------------------------------------------------------
+
+def _chars_to_lines(chars: list) -> list[dict]:
+    """Group pdfplumber chars into visual lines, sorted top-to-bottom."""
+    from collections import Counter
+    if not chars:
+        return []
+    buckets: dict[int, list] = {}
+    for ch in chars:
+        if not ch.get('text'):
+            continue
+        bucket = round(ch.get('top', 0) / 2) * 2  # snap to 2pt grid
+        buckets.setdefault(bucket, []).append(ch)
+    lines = []
+    for bucket in sorted(buckets):
+        line_chars = sorted(buckets[bucket], key=lambda c: c.get('x0', 0))
+        text = ''.join(c['text'] for c in line_chars)
+        sizes = [c['size'] for c in line_chars if c.get('size', 0) > 4]
+        dom_size = Counter(round(s, 1) for s in sizes).most_common(1)[0][0] if sizes else 0
+        is_bold = any('bold' in c.get('fontname', '').lower() for c in line_chars)
+        lines.append({'text': text, 'dominant_size': dom_size, 'is_bold': is_bold})
+    return lines
+
+
+def analyze_text_page(pdf_path: str, page_num: int) -> dict:
+    """
+    Zero-cost text-only page analysis using pdfplumber character data.
+    Uses font size to detect headings; one element per visual line so
+    _match_blocks_to_elements achieves maximum coverage — no content
+    ends up untagged as an artifact.
+    """
+    from collections import Counter
+    LIST_RE = re.compile(r'^([•·\-\*○●▪▸►]|\d+[\.\)]|[a-zA-Z][\.\)])\s+')
+
+    with pdfplumber.open(pdf_path) as pdf:
+        page = pdf.pages[page_num - 1]
+        chars = page.chars
+        if not chars:
+            return {"page": page_num, "elements": []}
+
+        lines = _chars_to_lines(chars)
+        if not lines:
+            return {"page": page_num, "elements": []}
+
+        # Body size = most common size among non-tiny chars (>4pt filters superscripts)
+        all_sizes = [round(c['size'], 1) for c in chars if c.get('size', 0) > 4]
+        if not all_sizes:
+            return {"page": page_num, "elements": []}
+        body_size = Counter(all_sizes).most_common(1)[0][0]
+
+        # Sizes noticeably above body → heading levels (largest = H1)
+        heading_sizes = sorted(
+            {round(l['dominant_size'], 1) for l in lines
+             if round(l['dominant_size'], 1) > body_size * 1.05},
+            reverse=True,
+        )
+        size_to_level = {s: min(i + 1, 6) for i, s in enumerate(heading_sizes)}
+
+        elements: list[dict] = []
+        list_items: list[str] = []
+        list_ordered = False
+
+        for line in lines:
+            text = line['text'].strip()
+            if not text:
+                if list_items:
+                    elements.append({"type": "list", "ordered": list_ordered, "items": list_items})
+                    list_items = []
+                continue
+
+            size = round(line['dominant_size'], 1)
+            is_list_item = bool(LIST_RE.match(text))
+
+            if not is_list_item and list_items:
+                elements.append({"type": "list", "ordered": list_ordered, "items": list_items})
+                list_items = []
+
+            if size in size_to_level:
+                elements.append({"type": "heading", "level": size_to_level[size], "text": text})
+            elif line['is_bold'] and not is_list_item and len(text) < 120 and size >= body_size * 0.95:
+                # Bold at body size → treat as a low-level section label
+                level = min(len(size_to_level) + 1 if size_to_level else 2, 4)
+                elements.append({"type": "heading", "level": level, "text": text})
+            elif is_list_item:
+                if not list_items:
+                    list_ordered = bool(re.match(r'^\d+[\.\)]\s+', text))
+                list_items.append(LIST_RE.sub('', text).strip())
+            else:
+                elements.append({"type": "paragraph", "text": text})
+
+        if list_items:
+            elements.append({"type": "list", "ordered": list_ordered, "items": list_items})
+
+        return {"page": page_num, "elements": elements}
+
+
+# Mock backend (last-resort fallback — no font data, no AI)
 # ---------------------------------------------------------------------------
 
 def analyze_with_mock(pdf_path: str, page_num: int, text_hint: str = "") -> dict:
@@ -467,20 +594,21 @@ def analyze_page(
 ) -> dict:
     """
     Tiered analysis:
-    - Simple pages (text only, no tables/images): use mock/text extraction — free, instant.
+    - Simple pages (text only, no tables/images): font-size-aware text extraction — free, instant.
     - Complex pages (tables, images): extract real images, then run AI for structure + alt text.
     """
     # Forced mock mode
     if backends.get("mock") and os.environ.get("MOCK_MODE") == "1":
         return analyze_with_mock(pdf_path, page_num, text_hint)
 
-    # Complexity check — skip AI entirely for simple pages
+    # Simple page — use font-aware text analyzer, zero cost, no AI needed
     complexity = classify_page_complexity(pdf_path, page_num)
-    if complexity == "simple" and not backends["ollama"] and not backends["claude"]:
-        return analyze_with_mock(pdf_path, page_num, text_hint)
     if complexity == "simple":
-        # Simple page: text extraction is sufficient, no AI needed
-        return analyze_with_mock(pdf_path, page_num, text_hint)
+        result = analyze_text_page(pdf_path, page_num)
+        # Fall back to mock only if chars extraction produced nothing
+        if not result.get("elements"):
+            result = analyze_with_mock(pdf_path, page_num, text_hint)
+        return result
 
     # Complex page: extract real images first
     page_images = extract_page_images(pdf_path, page_num)

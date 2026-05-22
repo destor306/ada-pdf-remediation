@@ -32,5 +32,9 @@ bcrypt>=4.0
 python-jose[cryptography]>=3.3
 itsdangerous>=2.1
 
+# Job queue (Redis/RQ optional — set REDIS_URL to enable)
+redis>=5.0
+rq>=2.0
+
 # Utilities
 httpx>=0.28
