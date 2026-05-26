@@ -22,6 +22,8 @@ logs/
 test_output.docx
 *.docx
 test_fldoe.pdf
+test_*.pdf
+*.db
 
 # IDE
 .vscode/

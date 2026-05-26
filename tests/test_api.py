@@ -39,7 +39,10 @@ def test_home_page():
 
 
 def test_admin_page():
-    resp = client.get("/admin/")
+    admin_password = os.environ.get("ADMIN_PASSWORD", "")
+    if not admin_password:
+        pytest.skip("ADMIN_PASSWORD not set — admin is locked")
+    resp = client.get("/admin/", auth=("admin", admin_password))
     assert resp.status_code == 200
     assert "Job Dashboard" in resp.text
 
