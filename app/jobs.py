@@ -125,6 +125,152 @@ def list_jobs() -> list[Job]:
         return list(_jobs.values())
 
 
+# ---------- helpers ----------
+
+def _convert_with_libreoffice(pdf_path: str, output_docx: str) -> bool:
+    """
+    Convert pdf_path → output_docx using LibreOffice headless.
+    Uses a per-call user-profile temp dir so concurrent jobs don't collide.
+    Returns True on success, False if LibreOffice is unavailable or fails.
+    """
+    import shutil
+    import subprocess
+    import tempfile
+
+    soffice = shutil.which("soffice") or shutil.which("libreoffice")
+    if not soffice:
+        return False
+
+    tmp_profile = tempfile.mkdtemp(prefix="lo_profile_")
+    try:
+        out_dir = Path(output_docx).parent
+        subprocess.run(
+            [
+                soffice,
+                "--headless",
+                f"-env:UserInstallation=file://{tmp_profile}",
+                "--infilter=writer_pdf_import",
+                "--convert-to", "docx",
+                "--outdir", str(out_dir),
+                pdf_path,
+            ],
+            capture_output=True,
+            timeout=180,
+        )
+        # LibreOffice exits non-zero on Java warnings even when conversion succeeds,
+        # so we check for the output file rather than trusting the return code.
+        lo_out = out_dir / (Path(pdf_path).stem + ".docx")
+        if not lo_out.exists():
+            return False
+        lo_out.rename(output_docx)
+        return True
+    except Exception:
+        return False
+    finally:
+        shutil.rmtree(tmp_profile, ignore_errors=True)
+
+
+def _make_docx_accessible(docx_path: str, pages_data: list) -> None:
+    """
+    Post-process a visually-converted DOCX to add semantic accessibility structure:
+    - Document language declaration (en-US)
+    - Word Heading styles derived from font-size heuristics
+    - w:tblHeader on every table's first row
+    - Alt text (descr) on inline images, using AI-extracted descriptions when available
+    """
+    from collections import Counter
+    from docx import Document
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+
+    try:
+        doc = Document(docx_path)
+    except Exception:
+        return
+
+    # 1. Language
+    doc.core_properties.language = "en-US"
+
+    # 2. Heading styles — detect by font size
+    sizes = []
+    for para in doc.paragraphs:
+        for run in para.runs:
+            if run.font.size:
+                sizes.append(round(run.font.size.pt, 1))
+
+    if sizes:
+        body_size = Counter(sizes).most_common(1)[0][0]
+        # Only treat sizes meaningfully larger than body as headings (≥20% bigger),
+        # and cap at H4 so generated levels are always sequential.
+        heading_sizes = sorted(
+            {s for s in sizes if s >= body_size * 1.2},
+            reverse=True,
+        )[:4]
+        size_to_level = {s: i + 1 for i, s in enumerate(heading_sizes)}
+
+        for para in doc.paragraphs:
+            if not para.runs:
+                continue
+            para_sizes = [round(r.font.size.pt, 1) for r in para.runs if r.font.size]
+            if not para_sizes:
+                continue
+            dominant = Counter(para_sizes).most_common(1)[0][0]
+            if dominant in size_to_level:
+                level = size_to_level[dominant]
+                style_name = f"Heading {level}"
+                try:
+                    para.style = doc.styles[style_name]
+                except KeyError:
+                    pass
+
+        # Normalize heading levels: fill any gaps so H2→H4 becomes H2→H3
+        max_seen = 0
+        for para in doc.paragraphs:
+            sname = para.style.name
+            if not sname.startswith("Heading "):
+                continue
+            try:
+                level = int(sname.split()[-1])
+            except ValueError:
+                continue
+            if level > max_seen + 1:
+                new_level = max_seen + 1
+                try:
+                    para.style = doc.styles[f"Heading {new_level}"]
+                    level = new_level
+                except KeyError:
+                    pass
+            max_seen = max(max_seen, level)
+
+    # 3. Table header rows
+    for table in doc.tables:
+        if not table.rows:
+            continue
+        first_tr = table.rows[0]._tr
+        trPr = first_tr.find(qn("w:trPr"))
+        if trPr is None:
+            trPr = OxmlElement("w:trPr")
+            first_tr.insert(0, trPr)
+        if trPr.find(qn("w:tblHeader")) is None:
+            tblHeader = OxmlElement("w:tblHeader")
+            trPr.append(tblHeader)
+
+    # 4. Alt text on inline images
+    ai_alts = []
+    for page in pages_data:
+        for elem in page.get("elements", []):
+            if elem.get("type") == "image":
+                ai_alts.append(elem.get("alt", "").strip() or "Figure")
+
+    ns_wp = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+    for i, img_elem in enumerate(doc.element.body.findall(f".//{{{ns_wp}}}inline")):
+        docPr = img_elem.find(f"{{{ns_wp}}}docPr")
+        if docPr is not None and not docPr.get("descr", "").strip():
+            docPr.set("descr", ai_alts[i] if i < len(ai_alts) else "Figure")
+
+    doc.save(docx_path)
+
+
 # ---------- execution ----------
 
 def _execute(job_id: str):
@@ -186,6 +332,9 @@ def _execute(job_id: str):
             cv.close()
         except Exception:
             build_docx(pages_data, job.output_path, page_dims=page_dims)
+
+        if Path(job.output_path).exists():
+            _make_docx_accessible(job.output_path, pages_data)
 
         job.progress = 97
         _save()
