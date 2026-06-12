@@ -135,7 +135,23 @@ def confirm_large_doc(page_count: int, cost_note: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def render_page_to_base64(pdf_path: str, page_number: int) -> str:
-    """Render a single PDF page to a base64 PNG."""
+    """Render a single PDF page to a base64 PNG.
+
+    Uses pdf2image+poppler when available; falls back to PyMuPDF (no poppler needed).
+    """
+    # Try PyMuPDF first — no poppler dependency, works on Windows out of the box
+    try:
+        import fitz
+        doc = fitz.open(pdf_path)
+        page = doc[page_number - 1]
+        mat = fitz.Matrix(DPI / 72, DPI / 72)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        buf = io.BytesIO(pix.tobytes("png"))
+        doc.close()
+        return base64.standard_b64encode(buf.getvalue()).decode("utf-8")
+    except ImportError:
+        pass  # fall through to pdf2image
+
     images = convert_from_path(
         pdf_path, dpi=DPI,
         first_page=page_number, last_page=page_number,
