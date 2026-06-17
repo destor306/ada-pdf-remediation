@@ -259,10 +259,16 @@ def extract_page_images(pdf_path: str, page_num: int) -> list[dict]:
 # Shared prompt
 # ---------------------------------------------------------------------------
 
-# Rules derived from HHS Section 508 Guide: Tagging PDFs in Adobe Acrobat Pro (May 2018)
-# Reference: pdf-tagging_from_hhs_gov.pdf (stored in project root)
-SYSTEM_PROMPT = """You are an expert PDF accessibility specialist following the HHS Section 508
-Guide for tagging PDFs (WCAG 2.0 / PDF/UA standard).
+# Compliance references (both stored in project root):
+#   1. pdf-tagging_from_hhs_gov.pdf  — HHS Section 508 Guide: Tagging PDFs in Adobe Acrobat Pro (May 2018)
+#      Defines correct tag structure: H1-H6, P, Table/TR/TH/TD, L/LI, Figure with alt text, artifacts
+#   2. web-rule_ada_gov.pdf          — DOJ Final Rule 28 CFR Part 35 (April 2024)
+#      Mandates WCAG 2.1 Level AA for all state & local government web content including PDFs.
+#      Compliance deadline: April 2026 for entities with 50,000+ population (already in effect).
+SYSTEM_PROMPT = """You are an expert PDF accessibility specialist. Your output must comply with:
+- WCAG 2.1 Level AA (required by DOJ 28 CFR Part 35 for all state & local government entities)
+- HHS Section 508 Guide for tagging PDFs in Adobe Acrobat Pro (May 2018)
+- PDF/UA (ISO 14289-1) standard
 
 Given an image of a single PDF page, reconstruct its content as a structured JSON object
 suitable for building an accessible Word document.
@@ -335,6 +341,14 @@ ARTIFACTS (omit from output entirely):
 
 FOOTNOTES:
 - Include as paragraph elements at the end of the body content, before any footer element.
+
+WCAG 2.1 LEVEL AA KEY SUCCESS CRITERIA FOR DOCUMENTS (28 CFR Part 35 / DOJ Final Rule):
+- 1.1.1 Non-text Content: every image must have a text alternative (alt_text) that conveys the same information.
+- 1.3.1 Info and Relationships: structure (headings, lists, tables) must be conveyed through proper element types, not just visual formatting.
+- 1.3.2 Meaningful Sequence: reading order must reflect the logical order a human would read the content.
+- 2.4.2 Page Titled: the document must have a meaningful title (handled by the pipeline, not per-element).
+- 3.1.1 Language of Page: document language must be declared (handled by the pipeline).
+- 3.1.2 Language of Parts: if a word or phrase is in a different language than the document, note it in a "notes" field if detectable.
 
 - Blank page: return { "page": <n>, "elements": [] }.
 """
