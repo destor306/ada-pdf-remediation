@@ -473,6 +473,75 @@
     .security-item { display: flex; align-items: center; gap: .6rem; font-size: .875rem; font-weight: 500; color: var(--slate); }
     .security-item svg { color: var(--green); }
 
+    /* ── DEADLINE BANNER ── */
+    .deadline-banner {
+      background: linear-gradient(135deg, #7C3AED 0%, #1D4ED8 100%);
+      padding: 3rem 2rem;
+    }
+    .deadline-inner {
+      max-width: 1100px;
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 2rem;
+      flex-wrap: wrap;
+    }
+    .deadline-left { flex: 1; min-width: 280px; }
+    .deadline-countdown {
+      display: flex;
+      flex-direction: column;
+      margin-bottom: .75rem;
+    }
+    .deadline-label {
+      font-size: .7rem;
+      font-weight: 700;
+      color: #C4B5FD;
+      text-transform: uppercase;
+      letter-spacing: .1em;
+    }
+    .deadline-date {
+      font-size: 2.25rem;
+      font-weight: 900;
+      color: white;
+      line-height: 1.1;
+    }
+    .deadline-text {
+      font-size: .875rem;
+      color: #C4B5FD;
+      line-height: 1.6;
+      max-width: 560px;
+    }
+    .deadline-text strong { color: white; }
+    .deadline-right {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: .75rem;
+      flex-shrink: 0;
+    }
+    .deadline-cta {
+      display: inline-block;
+      background: white;
+      color: #1D4ED8;
+      font-size: .875rem;
+      font-weight: 700;
+      padding: .65rem 1.4rem;
+      border-radius: 8px;
+      text-decoration: none;
+      transition: opacity .15s;
+      white-space: nowrap;
+    }
+    .deadline-cta:hover { opacity: .9; }
+    .deadline-laws {
+      font-size: .72rem;
+      color: #A78BFA;
+      display: flex;
+      gap: .4rem;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
     /* ── FOOTER ── */
     footer {
       background: var(--navy);
@@ -500,6 +569,7 @@
     <div class="nav-links">
       <a href="#how-it-works">How it works</a>
       <a href="#pricing">Pricing</a>
+      <a href="/compliance-guide">Compliance Guide</a>
     </div>
     <div class="nav-cta">
       {% if user %}
@@ -517,10 +587,10 @@
 <section class="hero">
   <div class="hero-badge">
     <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="10"/></svg>
-    ADA Title II deadline — compliance now required
+    Federal mandate — April 2027 compliance deadline
   </div>
   <h1>Make your PDFs <em>ADA compliant</em><br>in minutes, not weeks</h1>
-  <p>Upload any PDF. Our AI analyzes structure, fixes accessibility issues, and outputs a fully tagged PDF/UA document — ready for PAC 2026 validation.</p>
+  <p>Upload any PDF. Our AI analyzes structure, fixes accessibility issues, and outputs a fully tagged, WCAG 2.1 Level AA document — verified with Adobe Acrobat Pro.</p>
 
   {% if cancelled %}
   <div style="max-width:640px;margin:0 auto 1.5rem;" class="alert-info">Payment cancelled. Your file was not processed.</div>
@@ -613,7 +683,7 @@
           <button class="btn btn-outline" onclick="resetUpload()">Process another</button>
         </div>
         <div id="validate-note">
-          Validate with <a href="https://pac.pdf-accessibility.org" target="_blank">PAC 2026</a> to confirm full PDF/UA compliance.
+          Verify with Adobe Acrobat Pro Accessibility Checker (<strong>Tools → Accessibility → Accessibility Check</strong>) to confirm full compliance.
         </div>
       </div>
 
@@ -638,7 +708,7 @@
     </div>
     <div class="hero-trust-item">
       <svg width="14" height="14" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.857-9.809a.75.75 0 00-1.214-.882l-3.483 4.79-1.88-1.88a.75.75 0 10-1.06 1.061l2.5 2.5a.75.75 0 001.137-.089l4-5.5z" clip-rule="evenodd"/></svg>
-      PAC 2026 validated output
+      Adobe Acrobat Pro accessibility verified
     </div>
   </div>
 </section>
@@ -647,11 +717,36 @@
 <div class="compliance-bar">
   <p>Built for organizations required to comply with</p>
   <div class="compliance-logos">
-    <div class="compliance-logo">⚖️ ADA Title II</div>
+    <div class="compliance-logo">⚖️ ADA Title II (28 CFR Part 35)</div>
     <div class="compliance-logo">🏛 Section 508</div>
     <div class="compliance-logo">📋 PDF/UA ISO 14289</div>
-    <div class="compliance-logo">✅ WCAG 2.1 AA</div>
-    <div class="compliance-logo">🎯 PAC 2026</div>
+    <div class="compliance-logo">✅ WCAG 2.1 Level AA</div>
+    <div class="compliance-logo">🎯 Adobe Acrobat Pro Verified</div>
+  </div>
+</div>
+
+<!-- APRIL 2027 DEADLINE BANNER -->
+<div class="deadline-banner">
+  <div class="deadline-inner">
+    <div class="deadline-left">
+      <div class="deadline-countdown">
+        <span class="deadline-label">Federal Compliance Deadline</span>
+        <span class="deadline-date">April 2027</span>
+      </div>
+      <div class="deadline-text">
+        <strong>Is your agency ready?</strong> The DOJ Final Rule (28 CFR Part 35, April 2024) requires all state and local government entities to make web content and PDFs accessible to WCAG 2.1 Level AA by April 2027. Non-compliance exposes agencies to DOJ enforcement action and ADA lawsuits.
+      </div>
+    </div>
+    <div class="deadline-right">
+      <a href="/compliance-guide" class="deadline-cta">Read the compliance rules →</a>
+      <div class="deadline-laws">
+        <span>DOJ 28 CFR Part 35</span>
+        <span>·</span>
+        <span>Section 508</span>
+        <span>·</span>
+        <span>WCAG 2.1 AA</span>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -709,8 +804,8 @@
         <div class="feature-icon">
           <svg width="22" height="22" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.8"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75L11.25 15 15 9.75m-3-7.036A11.959 11.959 0 013.598 6 11.99 11.99 0 003 9.749c0 5.592 3.824 10.29 9 11.623 5.176-1.332 9-6.03 9-11.622 0-1.31-.21-2.571-.598-3.751h-.152c-3.196 0-6.1-1.248-8.25-3.285z"/></svg>
         </div>
-        <h3>PAC 2026 validated</h3>
-        <p>Output documents pass PAC 2026 — the gold-standard PDF/UA + WCAG checker used by accessibility auditors.</p>
+        <h3>Adobe Acrobat Pro verified</h3>
+        <p>Output documents pass Adobe Acrobat Pro's built-in Accessibility Checker — the tool government compliance officers actually use.</p>
       </div>
       <div class="feature-card">
         <div class="feature-icon">
@@ -845,10 +940,16 @@
       </div>
       <div class="footer-links">
         <h4>Compliance</h4>
-        <a href="#">ADA Title II</a>
-        <a href="#">Section 508</a>
-        <a href="#">PDF/UA</a>
-        <a href="#">WCAG 2.1</a>
+        <a href="/compliance-guide#ada">ADA Title II</a>
+        <a href="/compliance-guide#section508">Section 508</a>
+        <a href="/compliance-guide#pdfua">PDF/UA</a>
+        <a href="/compliance-guide#wcag">WCAG 2.1 AA</a>
+      </div>
+      <div class="footer-links">
+        <h4>Resources</h4>
+        <a href="/compliance-guide">Compliance Guide</a>
+        <a href="/compliance-guide#tagging">PDF Tagging Rules</a>
+        <a href="/compliance-guide#deadline">April 2027 Deadline</a>
       </div>
       <div class="footer-links">
         <h4>Account</h4>

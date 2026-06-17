@@ -32,6 +32,14 @@ async def index(
     })
 
 
+@router.get("/compliance-guide", response_class=HTMLResponse)
+async def compliance_guide(request: Request, user=Depends(get_current_user)):
+    return templates.TemplateResponse(request, "compliance_guide.html", {
+        "request": request,
+        "user": user,
+    })
+
+
 @router.get("/dashboard", response_class=HTMLResponse)
 async def dashboard_redirect():
     from fastapi.responses import RedirectResponse

@@ -264,7 +264,7 @@ def extract_page_images(pdf_path: str, page_num: int) -> list[dict]:
 #      Defines correct tag structure: H1-H6, P, Table/TR/TH/TD, L/LI, Figure with alt text, artifacts
 #   2. web-rule_ada_gov.pdf          — DOJ Final Rule 28 CFR Part 35 (April 2024)
 #      Mandates WCAG 2.1 Level AA for all state & local government web content including PDFs.
-#      Compliance deadline: April 2026 for entities with 50,000+ population (already in effect).
+#      Compliance deadlines: April 2026 (50,000+ population), April 2027 (all remaining entities).
 SYSTEM_PROMPT = """You are an expert PDF accessibility specialist. Your output must comply with:
 - WCAG 2.1 Level AA (required by DOJ 28 CFR Part 35 for all state & local government entities)
 - HHS Section 508 Guide for tagging PDFs in Adobe Acrobat Pro (May 2018)
