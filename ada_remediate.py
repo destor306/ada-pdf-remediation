@@ -295,7 +295,7 @@ Rules:
   (e.g. "Bar chart showing Q3 revenue by region", "Signature of John Smith", "Company logo").
   Include one image element per visible image, in top-to-bottom order.
 - Footnotes: include as paragraph elements at the end.
-- Omit decorative page numbers, running headers/footers, and horizontal rules.
+- Include page headers and footers as paragraph elements at the top and bottom of the page content respectively. Omit only horizontal rules.
 - Blank page: return { "page": <n>, "elements": [] }.
 - For tables: estimate col_widths as relative proportions matching the visual column widths.
 """
@@ -735,6 +735,9 @@ def build_docx(pages_data: list[dict], output_path: str, page_dims: list[tuple[f
     for idx, page_data in enumerate(pages_data):
         elements = page_data.get("elements", [])
         if not elements:
+            # Preserve page count: still emit a page break for blank/unextracted pages
+            if idx < len(pages_data) - 1:
+                doc.add_page_break()
             continue
 
         # Use this page's dimensions for column width calculations
