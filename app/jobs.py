@@ -295,7 +295,7 @@ def _execute(job_id: str):
 
         from ada_remediate import (
             detect_backends, extract_text_layer, get_page_dimensions,
-            analyze_page, build_docx, tag_pdf_with_accessibility, MAX_PAGES,
+            analyze_page, tag_pdf_with_accessibility, MAX_PAGES,
         )
 
         backends = detect_backends()
@@ -325,16 +325,8 @@ def _execute(job_id: str):
 
         job.progress = 93
         _save()
-        try:
-            from pdf2docx import Converter
-            cv = Converter(job.pdf_path)
-            cv.convert(job.output_path, start=0, end=None)
-            cv.close()
-        except Exception:
-            build_docx(pages_data, job.output_path, page_dims=page_dims)
-
-        if Path(job.output_path).exists():
-            _make_docx_accessible(job.output_path, pages_data)
+        from ada_remediate import convert_to_docx
+        convert_to_docx(job.pdf_path, job.output_path, pages_data, page_dims=page_dims, title=doc_title)
 
         job.progress = 97
         _save()

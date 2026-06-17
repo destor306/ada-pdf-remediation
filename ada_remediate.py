@@ -271,7 +271,7 @@ JSON schema:
   "page": <int>,
   "elements": [
     {
-      "type": "heading" | "paragraph" | "table" | "list" | "caption" | "image",
+      "type": "heading" | "paragraph" | "table" | "list" | "caption" | "image" | "header" | "footer",
       "level": <int 1-6>,               // headings only
       "text": "<string>",               // all text types
       "alt_text": "<string>",           // image only — descriptive alt text for accessibility
@@ -294,8 +294,10 @@ Rules:
 - Images/charts/signatures/photos: use type "image". Write alt_text that describes what the image shows
   (e.g. "Bar chart showing Q3 revenue by region", "Signature of John Smith", "Company logo").
   Include one image element per visible image, in top-to-bottom order.
-- Footnotes: include as paragraph elements at the end.
-- Include page headers and footers as paragraph elements at the top and bottom of the page content respectively. Omit only horizontal rules.
+- Page footer (text printed in the bottom margin area, below the main content): use type "footer".
+- Running page header (small repeated text in the top margin that appears identically across multiple pages, e.g. document title or chapter name in the margin): use type "header". Do NOT use "header" for a page title or section heading that appears only on one page — those are "heading" elements.
+- Footnotes: include as paragraph elements at the end of the body content, before the footer.
+- Omit only decorative horizontal rules.
 - Blank page: return { "page": <n>, "elements": [] }.
 - For tables: estimate col_widths as relative proportions matching the visual column widths.
 """
@@ -454,7 +456,7 @@ def _chars_to_lines(chars: list) -> list[dict]:
         sizes = [c['size'] for c in line_chars if c.get('size', 0) > 4]
         dom_size = Counter(round(s, 1) for s in sizes).most_common(1)[0][0] if sizes else 0
         is_bold = any('bold' in c.get('fontname', '').lower() for c in line_chars)
-        lines.append({'text': text, 'dominant_size': dom_size, 'is_bold': is_bold})
+        lines.append({'text': text, 'dominant_size': dom_size, 'is_bold': is_bold, 'top': bucket})
     return lines
 
 
@@ -474,6 +476,7 @@ def analyze_text_page(pdf_path: str, page_num: int) -> dict:
         if not chars:
             return {"page": page_num, "elements": []}
 
+        page_height = float(page.height)
         lines = _chars_to_lines(chars)
         if not lines:
             return {"page": page_num, "elements": []}
@@ -492,6 +495,11 @@ def analyze_text_page(pdf_path: str, page_num: int) -> dict:
         )
         size_to_level = {s: min(i + 1, 6) for i, s in enumerate(heading_sizes)}
 
+        # Bottom 8% of page = footer zone.
+        # Headers are NOT detected by position — a page title at the top looks identical
+        # to a running header positionally. Leave header classification to the AI.
+        footer_threshold = page_height * 0.92
+
         elements: list[dict] = []
         list_items: list[str] = []
         list_ordered = False
@@ -504,6 +512,16 @@ def analyze_text_page(pdf_path: str, page_num: int) -> dict:
                     list_items = []
                 continue
 
+            top = line.get('top', 0)
+
+            # Position-based footer detection only
+            if top > footer_threshold:
+                if list_items:
+                    elements.append({"type": "list", "ordered": list_ordered, "items": list_items})
+                    list_items = []
+                elements.append({"type": "footer", "text": text})
+                continue
+
             size = round(line['dominant_size'], 1)
             is_list_item = bool(LIST_RE.match(text))
 
@@ -514,7 +532,6 @@ def analyze_text_page(pdf_path: str, page_num: int) -> dict:
             if size in size_to_level:
                 elements.append({"type": "heading", "level": size_to_level[size], "text": text})
             elif line['is_bold'] and not is_list_item and len(text) < 120 and size >= body_size * 0.95:
-                # Bold at body size → treat as a low-level section label
                 level = min(len(size_to_level) + 1 if size_to_level else 2, 4)
                 elements.append({"type": "heading", "level": level, "text": text})
             elif is_list_item:
@@ -732,9 +749,27 @@ def build_docx(pages_data: list[dict], output_path: str, page_dims: list[tuple[f
     if page_dims:
         set_page_size(doc.sections[0], page_dims[0][0], page_dims[0][1])
 
+    current_section = doc.sections[0]
+
     for idx, page_data in enumerate(pages_data):
         elements = page_data.get("elements", [])
-        if not elements:
+
+        # Split header/footer elements out before the empty-page check
+        header_elems = [e for e in elements if e.get("type") == "header"]
+        footer_elems = [e for e in elements if e.get("type") == "footer"]
+        body_elems   = [e for e in elements if e.get("type") not in ("header", "footer")]
+
+        # Write header/footer into the DOCX section (not as body paragraphs)
+        if header_elems:
+            current_section.header.is_linked_to_previous = False
+            hdr_para = current_section.header.paragraphs[0]
+            hdr_para.text = " ".join(e.get("text", "") for e in header_elems)
+        if footer_elems:
+            current_section.footer.is_linked_to_previous = False
+            ftr_para = current_section.footer.paragraphs[0]
+            ftr_para.text = " ".join(e.get("text", "") for e in footer_elems)
+
+        if not body_elems:
             # Preserve page count: still emit a page break for blank/unextracted pages
             if idx < len(pages_data) - 1:
                 doc.add_page_break()
@@ -746,7 +781,7 @@ def build_docx(pages_data: list[dict], output_path: str, page_dims: list[tuple[f
         else:
             page_w = 8.5  # default letter width
 
-        for elem in elements:
+        for elem in body_elems:
             etype = elem.get("type", "paragraph")
             text = elem.get("text", "").strip()
 
@@ -822,8 +857,8 @@ def build_docx(pages_data: list[dict], output_path: str, page_dims: list[tuple[f
                 next_w, next_h = page_dims[idx + 1]
                 curr_w, curr_h = page_dims[idx]
                 if abs(next_w - curr_w) > 0.1 or abs(next_h - curr_h) > 0.1:
-                    new_section = doc.add_section()
-                    set_page_size(new_section, next_w, next_h)
+                    current_section = doc.add_section()
+                    set_page_size(current_section, next_w, next_h)
 
     doc.save(output_path)
 
@@ -1253,6 +1288,189 @@ def tag_pdf_with_accessibility(
 
 
 # ---------------------------------------------------------------------------
+# Shared DOCX conversion (used by both CLI and web job)
+# ---------------------------------------------------------------------------
+
+def make_docx_accessible(docx_path: str, pages_data: list[dict]) -> None:
+    """
+    Post-process a visually-converted DOCX to add semantic accessibility structure:
+    heading styles, table header rows, image alt text, and document language.
+    """
+    from collections import Counter
+
+    try:
+        doc = Document(docx_path)
+    except Exception:
+        return
+
+    doc.core_properties.language = "en-US"
+
+    # Heading styles — detect by font size
+    sizes = []
+    for para in doc.paragraphs:
+        for run in para.runs:
+            if run.font.size:
+                sizes.append(round(run.font.size.pt, 1))
+
+    if sizes:
+        body_size = Counter(sizes).most_common(1)[0][0]
+        heading_sizes = sorted(
+            {s for s in sizes if s >= body_size * 1.2},
+            reverse=True,
+        )[:4]
+        size_to_level = {s: i + 1 for i, s in enumerate(heading_sizes)}
+
+        for para in doc.paragraphs:
+            if not para.runs:
+                continue
+            para_sizes = [round(r.font.size.pt, 1) for r in para.runs if r.font.size]
+            if not para_sizes:
+                continue
+            dominant = Counter(para_sizes).most_common(1)[0][0]
+            if dominant in size_to_level:
+                try:
+                    para.style = doc.styles[f"Heading {size_to_level[dominant]}"]
+                except KeyError:
+                    pass
+
+        # Normalize heading levels so there are no gaps (e.g. H1 → H3 becomes H1 → H2)
+        max_seen = 0
+        for para in doc.paragraphs:
+            sname = para.style.name
+            if not sname.startswith("Heading "):
+                continue
+            try:
+                level = int(sname.split()[-1])
+            except ValueError:
+                continue
+            if level > max_seen + 1:
+                try:
+                    para.style = doc.styles[f"Heading {max_seen + 1}"]
+                    level = max_seen + 1
+                except KeyError:
+                    pass
+            max_seen = max(max_seen, level)
+
+    # Table header rows — mark first row of every table with w:tblHeader
+    for table in doc.tables:
+        if not table.rows:
+            continue
+        first_tr = table.rows[0]._tr
+        trPr = first_tr.find(qn("w:trPr"))
+        if trPr is None:
+            trPr = OxmlElement("w:trPr")
+            first_tr.insert(0, trPr)
+        if trPr.find(qn("w:tblHeader")) is None:
+            trPr.append(OxmlElement("w:tblHeader"))
+
+    # Alt text on inline images using AI-extracted descriptions
+    ai_alts = [
+        elem.get("alt_text", "").strip() or "Figure"
+        for page in pages_data
+        for elem in page.get("elements", [])
+        if elem.get("type") == "image"
+    ]
+    ns_wp = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+    for i, img_elem in enumerate(doc.element.body.findall(f".//{{{ns_wp}}}inline")):
+        docPr = img_elem.find(f"{{{ns_wp}}}docPr")
+        if docPr is not None and not docPr.get("descr", "").strip():
+            docPr.set("descr", ai_alts[i] if i < len(ai_alts) else "Figure")
+
+    # Move footer/header text from body into actual DOCX section footer/header.
+    # pdf2docx converts PDF drawString footer/header as body paragraphs — detect
+    # them by matching against position-extracted elements, then relocate them.
+
+    # Collect per-page footer/header texts with their page index
+    page_footer_texts: dict[int, list[str]] = {}
+    page_header_texts: dict[int, list[str]] = {}
+    for pi, page in enumerate(pages_data):
+        for elem in page.get("elements", []):
+            t = elem.get("text", "").strip()
+            if not t:
+                continue
+            if elem.get("type") == "footer":
+                page_footer_texts.setdefault(pi, []).append(t)
+            elif elem.get("type") == "header":
+                page_header_texts.setdefault(pi, []).append(t)
+
+    all_footer_texts = [t for texts in page_footer_texts.values() for t in texts]
+    all_header_texts = [t for texts in page_header_texts.values() for t in texts]
+
+    if all_footer_texts or all_header_texts:
+        section = doc.sections[0]
+        paras_to_remove = []
+
+        for para in doc.paragraphs:
+            text = para.text.strip()
+            if not text:
+                continue
+            if any(text in ft or ft in text for ft in all_footer_texts):
+                paras_to_remove.append(para)
+            elif any(text in ht or ht in text for ht in all_header_texts):
+                paras_to_remove.append(para)
+
+        if all_footer_texts:
+            footer_text = " | ".join(dict.fromkeys(all_footer_texts))
+            footer_page_indices = set(page_footer_texts.keys())
+            all_page_indices = set(range(len(pages_data)))
+
+            if footer_page_indices == {0} or footer_page_indices.issubset({0}):
+                # Footer only on first page — use Word's "different first page" feature
+                section.different_first_page_header_footer = True
+                section.first_page_footer.is_linked_to_previous = False
+                section.first_page_footer.paragraphs[0].text = footer_text
+            else:
+                # Footer on multiple/all pages — set as section-wide footer
+                section.footer.is_linked_to_previous = False
+                section.footer.paragraphs[0].text = footer_text
+
+        if all_header_texts:
+            header_text = " ".join(dict.fromkeys(all_header_texts))
+            header_page_indices = set(page_header_texts.keys())
+
+            if header_page_indices == {0} or header_page_indices.issubset({0}):
+                section.different_first_page_header_footer = True
+                section.first_page_header.is_linked_to_previous = False
+                section.first_page_header.paragraphs[0].text = header_text
+            else:
+                section.header.is_linked_to_previous = False
+                section.header.paragraphs[0].text = header_text
+
+        for para in paras_to_remove:
+            para._element.getparent().remove(para._element)
+
+    doc.save(docx_path)
+
+
+def convert_to_docx(
+    pdf_path: str,
+    output_path: str,
+    pages_data: list[dict],
+    page_dims: list[tuple[float, float]] | None = None,
+    title: str = "",
+) -> None:
+    """
+    Convert PDF to DOCX using pdf2docx for best visual fidelity, falling back to
+    build_docx if pdf2docx is unavailable. Always runs accessibility post-processing.
+    """
+    converted = False
+    try:
+        from pdf2docx import Converter
+        cv = Converter(pdf_path)
+        cv.convert(output_path, start=0, end=None)
+        cv.close()
+        converted = True
+    except Exception:
+        pass
+
+    if not converted:
+        build_docx(pages_data, output_path, page_dims=page_dims, title=title)
+
+    if Path(output_path).exists():
+        make_docx_accessible(output_path, pages_data)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1355,7 +1573,7 @@ def main():
 
     # --- Step 7: Also build DOCX for editing ---
     print(f"\nBuilding editable .docx → {docx_output_path}")
-    build_docx(pages_data, docx_output_path, page_dims=page_dims)
+    convert_to_docx(pdf_path, docx_output_path, pages_data, page_dims=page_dims, title=doc_title)
 
     print(f"\nDone!")
     print(f"  PDF file (primary):  {pdf_output_path}  ← visually identical to source")
