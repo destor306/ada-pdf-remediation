@@ -11,7 +11,16 @@ Runs a layered check stack against a remediated .docx and/or exported .pdf:
     • Text coverage vs. source PDF (detect content loss)
     • Language declaration
 
-  Layer 2 — PDF/UA validation via VeraPDF (runs if Java + VeraPDF available)
+  Layer 2 — PDF tag-tree audit via pikepdf (always runs if a PDF is given)
+    • Reads the same StructTreeRoot data Acrobat's Full Check reads —
+      no Java, no install, no internet required
+    • Tagged-PDF flag, document language, title, DisplayDocTitle
+    • Heading tag hierarchy in the actual PDF (not just the docx)
+    • Table TH cells and /Scope attribute
+    • Figure tags and their /Alt text
+    • Form field tagging and tooltip (/TU) presence
+
+  Layer 3 — PDF/UA validation via VeraPDF (runs if Java + VeraPDF available)
     • Full PDF/UA-1 (ISO 14289-1) conformance check
     • Reports clause-level failures
 
@@ -26,6 +35,7 @@ Install VeraPDF (optional but recommended for production):
 
 import sys
 import os
+import re
 import subprocess
 import tempfile
 import json
@@ -35,6 +45,7 @@ from dataclasses import dataclass, field
 sys.stdout.reconfigure(encoding='utf-8')
 
 import pdfplumber
+import pikepdf
 from pdf2image import convert_from_path
 from docx import Document
 from docx.oxml.ns import qn
@@ -269,7 +280,183 @@ def run_docx_checks(source_pdf: str, docx_path: str, report: CheckReport):
 
 
 # ---------------------------------------------------------------------------
-# Layer 2: VeraPDF (PDF/UA-1)
+# Layer 2: PDF tag-tree audit (pikepdf) — mirrors what Acrobat's Full Check
+# reads directly off the PDF's StructTreeRoot. No Java, no install needed.
+# ---------------------------------------------------------------------------
+
+def _walk_struct(node, callback):
+    """Recursively visit structure elements under `node`, calling
+    callback(tag_name, elem) for every real StructElem (skips MCID ints
+    and /MCR /OBJR marked-content references, which are leaves)."""
+    if isinstance(node, pikepdf.Array):
+        for child in node:
+            _walk_struct(child, callback)
+        return
+    if not isinstance(node, pikepdf.Dictionary):
+        return
+    if str(node.get("/Type", "")) in ("/MCR", "/OBJR"):
+        return
+    tag = node.get("/S")
+    tag_name = str(tag)[1:] if tag is not None else None
+    if tag_name:
+        callback(tag_name, node)
+    kids = node.get("/K")
+    if kids is not None:
+        _walk_struct(kids, callback)
+
+
+def _struct_attr(elem, name):
+    """Look up an attribute (e.g. /Scope) across an element's /A attribute
+    object(s), which may be a single dict or an array of dicts."""
+    attrs = elem.get("/A")
+    if attrs is None:
+        return None
+    attr_list = attrs if isinstance(attrs, pikepdf.Array) else [attrs]
+    for a in attr_list:
+        if isinstance(a, pikepdf.Dictionary) and a.get(name) is not None:
+            return a.get(name)
+    return None
+
+
+def check_pdf_tags(pdf_path: str, report: CheckReport):
+    """Inspect the actual exported PDF's structure tree — the same data
+    Acrobat's accessibility checker reads — rather than the pre-export docx."""
+    print("Running PDF tag-tree audit (pikepdf)...")
+    try:
+        pdf = pikepdf.open(pdf_path)
+    except Exception as e:
+        report.warn("PDF Tags", f"Could not open PDF for tag inspection: {e}")
+        return
+
+    root = pdf.Root
+
+    mark_info = root.get("/MarkInfo")
+    tagged = bool(mark_info and mark_info.get("/Marked"))
+    if tagged:
+        report.ok("PDF Tags", "Document is marked as Tagged PDF (/MarkInfo /Marked)")
+    else:
+        report.error("PDF Tags", "Document is NOT marked as Tagged PDF — Acrobat will flag this immediately")
+
+    lang = root.get("/Lang")
+    if lang:
+        report.ok("PDF Tags", f"Document language set in PDF catalog: {lang}")
+    else:
+        report.error("PDF Tags", "No /Lang set in PDF catalog (required for screen readers)")
+
+    title = None
+    try:
+        title = pdf.docinfo.get("/Title")
+    except Exception:
+        pass
+    if title:
+        report.ok("PDF Tags", f"Document title set: {title}")
+    else:
+        report.error("PDF Tags", "No document title set (Document Properties > Title)")
+
+    viewer_prefs = root.get("/ViewerPreferences")
+    if viewer_prefs and viewer_prefs.get("/DisplayDocTitle"):
+        report.ok("PDF Tags", "DisplayDocTitle is set — title bar will show document title")
+    else:
+        report.warn("PDF Tags", "DisplayDocTitle not set true — title bar may show filename instead of title")
+
+    struct_root = root.get("/StructTreeRoot")
+    if not struct_root:
+        report.error("PDF Tags", "No /StructTreeRoot found — document has no logical structure tree")
+        pdf.close()
+        return
+    report.ok("PDF Tags", "Logical structure tree (StructTreeRoot) present")
+
+    headings = []
+    figures = []
+    tables = []
+
+    def visit(tag_name, elem):
+        if re.fullmatch(r"H[1-6]", tag_name):
+            headings.append(int(tag_name[1]))
+        elif tag_name == "Figure":
+            alt = elem.get("/Alt")
+            figures.append(str(alt) if alt else None)
+        elif tag_name == "Table":
+            tables.append(elem)
+
+    kids = struct_root.get("/K")
+    if kids is not None:
+        _walk_struct(kids, visit)
+
+    if not headings:
+        report.warn("PDF Tags", "No heading tags (H1-H6) found in PDF structure tree")
+    else:
+        report.ok("PDF Tags", f"Found {len(headings)} heading tag(s) in PDF structure tree")
+        if headings[0] != 1:
+            report.warn("PDF Tags", f"Structure tree does not start with H1 (starts at H{headings[0]})")
+        for i in range(1, len(headings)):
+            if headings[i] > headings[i - 1] + 1:
+                report.error("PDF Tags", f"Skipped heading level in PDF tags: H{headings[i-1]} -> H{headings[i]}")
+
+    if figures:
+        missing_alt = sum(1 for a in figures if not a)
+        if missing_alt:
+            report.error("PDF Tags", f"{missing_alt}/{len(figures)} Figure tag(s) missing /Alt text in the actual PDF")
+        else:
+            report.ok("PDF Tags", f"All {len(figures)} Figure tag(s) have /Alt text in the PDF")
+    else:
+        report.ok("PDF Tags", "No Figure tags found in PDF structure tree")
+
+    if tables:
+        report.ok("PDF Tags", f"Found {len(tables)} Table tag(s) in PDF structure tree")
+        for idx, table in enumerate(tables, 1):
+            counts = {"th": 0, "scoped": 0}
+
+            def visit_table_cells(tag_name, elem):
+                if tag_name == "TH":
+                    counts["th"] += 1
+                    if _struct_attr(elem, "/Scope") is not None:
+                        counts["scoped"] += 1
+
+            table_kids = table.get("/K")
+            if table_kids is not None:
+                _walk_struct(table_kids, visit_table_cells)
+
+            if counts["th"] == 0:
+                report.error("PDF Tags", f"Table {idx}: no TH (header cell) tags found in PDF structure")
+            elif counts["scoped"] < counts["th"]:
+                report.warn("PDF Tags", f"Table {idx}: {counts['th']-counts['scoped']}/{counts['th']} TH cell(s) missing /Scope attribute")
+            else:
+                report.ok("PDF Tags", f"Table {idx}: all TH cells have /Scope set")
+    else:
+        report.ok("PDF Tags", "No Table tags found in PDF structure tree")
+
+    total_widgets = 0
+    untagged_widgets = 0
+    missing_tu = 0
+    for page in pdf.pages:
+        annots = page.get("/Annots")
+        if not annots:
+            continue
+        for annot in annots:
+            if str(annot.get("/Subtype", "")) != "/Widget":
+                continue
+            total_widgets += 1
+            if "/StructParent" not in annot:
+                untagged_widgets += 1
+            if not annot.get("/TU"):
+                missing_tu += 1
+
+    if total_widgets:
+        if untagged_widgets:
+            report.error("PDF Tags", f"{untagged_widgets}/{total_widgets} form field(s) not tagged (missing /StructParent)")
+        else:
+            report.ok("PDF Tags", f"All {total_widgets} form field(s) tagged")
+        if missing_tu:
+            report.warn("PDF Tags", f"{missing_tu}/{total_widgets} form field(s) missing tooltip /TU description")
+    else:
+        report.ok("PDF Tags", "No form fields found")
+
+    pdf.close()
+
+
+# ---------------------------------------------------------------------------
+# Layer 3: VeraPDF (PDF/UA-1)
 # ---------------------------------------------------------------------------
 
 def find_verapdf() -> str | None:
@@ -447,16 +634,17 @@ def main():
     # Layer 1 — always runs
     run_docx_checks(source_pdf, docx_path, report)
 
-    # Layer 2 & 3 — only if an output PDF was provided
+    # Layer 2, 3 & 4 — only if an output PDF was provided
     if pdf_path:
         if not os.path.exists(pdf_path):
-            report.warn("PDF/UA (VeraPDF)", f"PDF not found: {pdf_path} — skipping PDF/UA and visual checks")
+            report.warn("PDF Tags", f"PDF not found: {pdf_path} — skipping PDF tag, PDF/UA, and visual checks")
         else:
+            check_pdf_tags(pdf_path, report)
             run_verapdf(pdf_path, report)
             check_visual_similarity(source_pdf, pdf_path, report)
     else:
         report.warn(
-            "PDF/UA (VeraPDF)",
+            "PDF Tags",
             "No output PDF provided — export from Word and re-run:\n"
             "    python3 ada_check.py source.pdf output.docx output.pdf"
         )

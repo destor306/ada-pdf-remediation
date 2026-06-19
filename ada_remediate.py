@@ -275,6 +275,12 @@ suitable for building an accessible Word document.
 
 Return ONLY valid JSON — no markdown fences, no explanation.
 
+CRITICAL: Always populate "elements" (and "rows"/"items" within it) as true nested
+JSON arrays of objects — never as a JSON-encoded string. If any source text contains a
+literal quotation mark (e.g. a form field reading `Form I-94 with "RE" notation`), you
+MUST escape it as \" inside the JSON string — never emit an unescaped " inside a string
+value, since that silently breaks the surrounding object.
+
 JSON schema:
 {
   "page": <int>,
@@ -375,17 +381,18 @@ def parse_json_response(raw: str, page_num: int) -> dict:
         return _recover_partial_elements(raw, page_num)
 
 
-def _recover_partial_elements(raw: str, page_num: int) -> dict:
-    """Extract complete JSON objects from a truncated elements array."""
-    m = re.search(r'"elements"\s*:\s*\[', raw)
-    if not m:
-        return {"page": page_num, "elements": []}
-    elements = []
-    pos = m.end()
+def _extract_json_objects(text: str, start: int = 0) -> list[dict]:
+    """Extract complete top-level {...} objects from inside a JSON array's
+    text, skipping any individual object that fails to parse (e.g. because an
+    unescaped literal quote in the source text broke just that one object).
+    More tolerant than json.loads on the whole array: one bad element doesn't
+    sink everything after it.
+    """
+    objects = []
     depth = 0
     obj_start = None
-    for i in range(pos, len(raw)):
-        ch = raw[i]
+    for i in range(start, len(text)):
+        ch = text[i]
         if ch == '{':
             if depth == 0:
                 obj_start = i
@@ -393,13 +400,46 @@ def _recover_partial_elements(raw: str, page_num: int) -> dict:
         elif ch == '}':
             depth -= 1
             if depth == 0 and obj_start is not None:
+                segment = text[obj_start:i + 1]
                 try:
-                    elements.append(json.loads(raw[obj_start:i + 1]))
+                    objects.append(json.loads(segment))
                 except json.JSONDecodeError:
-                    pass
+                    repaired = _repair_object(segment)
+                    if repaired:
+                        objects.append(repaired)
                 obj_start = None
         elif ch == ']' and depth == 0:
             break
+    return objects
+
+
+def _repair_object(text: str) -> dict | None:
+    """Best-effort repair for a {...} element that failed to parse whole.
+
+    The dominant case: a "table" element with many rows where exactly one
+    row's cell text has an unescaped quote. Without this, that single bad
+    row sinks the *entire* table — every other row is lost too, not just the
+    broken one. Recover whatever rows/items parse cleanly instead of
+    discarding the whole element.
+    """
+    type_m = re.search(r'"type"\s*:\s*"(\w+)"', text)
+    etype = type_m.group(1) if type_m else None
+
+    if etype == 'table':
+        rows_m = re.search(r'"rows"\s*:\s*\[', text)
+        if rows_m:
+            rows = _extract_json_objects(text, rows_m.end())
+            if rows:
+                return {"type": "table", "rows": rows}
+    return None
+
+
+def _recover_partial_elements(raw: str, page_num: int) -> dict:
+    """Extract complete JSON objects from a truncated elements array."""
+    m = re.search(r'"elements"\s*:\s*\[', raw)
+    if not m:
+        return {"page": page_num, "elements": []}
+    elements = _extract_json_objects(raw, m.end())
     if elements:
         print(f"  [info] Recovered {len(elements)} element(s) from truncated page {page_num}")
     return {"page": page_num, "elements": elements}
@@ -459,30 +499,126 @@ def analyze_with_ollama(pdf_path: str, page_num: int, text_hint: str = "", image
 # Claude API fallback
 # ---------------------------------------------------------------------------
 
+PAGE_ELEMENTS_TOOL = {
+    "name": "emit_page_elements",
+    "description": "Emit the structured representation of the analyzed PDF page.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "page": {"type": "integer"},
+            "elements": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "type": {
+                            "type": "string",
+                            "enum": ["heading", "paragraph", "table", "list", "caption",
+                                     "image", "header", "footer"],
+                        },
+                        "level": {"type": "integer", "minimum": 1, "maximum": 6},
+                        "text": {"type": "string"},
+                        "alt_text": {"type": "string"},
+                        "caption": {"type": "string"},
+                        "rows": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "is_header": {"type": "boolean"},
+                                    "col_scope": {"type": ["string", "null"], "enum": ["col", "row", None]},
+                                    "cells": {"type": "array", "items": {"type": "string"}},
+                                },
+                                "required": ["cells"],
+                            },
+                        },
+                        "col_widths": {"type": "array", "items": {"type": "number"}},
+                        "items": {"type": "array", "items": {"type": "string"}},
+                        "ordered": {"type": "boolean"},
+                    },
+                    "required": ["type"],
+                },
+            },
+        },
+        "required": ["page", "elements"],
+    },
+}
+
+
 def analyze_with_claude(pdf_path: str, page_num: int, text_hint: str = "", image_count: int = 0) -> dict:
-    """Analyze page with Claude vision API."""
+    """Analyze page with Claude vision API.
+
+    Uses tool-use (not freeform JSON-in-text) so the API parses the structured
+    output server-side. Freeform generation broke whenever source text on the
+    page contained a literal quote character (e.g. a form field reading
+    `Form I-94 with "RE" notation`) — the model would emit it unescaped and
+    corrupt the surrounding JSON. Forcing a tool call sidesteps that failure
+    mode entirely.
+    """
     import anthropic
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     client = anthropic.Anthropic(api_key=api_key)
     image_b64 = render_page_to_base64(pdf_path, page_num)
 
-    response = client.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=8192,
-        system=SYSTEM_PROMPT,
-        messages=[{
-            "role": "user",
-            "content": [
-                {
-                    "type": "image",
-                    "source": {"type": "base64", "media_type": "image/png", "data": image_b64},
-                },
-                {"type": "text", "text": user_message_text(page_num, text_hint, image_count)},
-            ],
-        }],
-    )
-    raw = response.content[0].text.strip()
-    return parse_json_response(raw, page_num)
+    def _call() -> dict:
+        response = client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=8192,
+            system=SYSTEM_PROMPT,
+            tools=[PAGE_ELEMENTS_TOOL],
+            tool_choice={"type": "tool", "name": "emit_page_elements"},
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": "image/png", "data": image_b64},
+                    },
+                    {"type": "text", "text": user_message_text(page_num, text_hint, image_count)},
+                ],
+            }],
+        )
+
+        if response.stop_reason == "max_tokens":
+            print(f"  [warn] Claude tool call hit max_tokens on page {page_num} — output may be incomplete")
+
+        for block in response.content:
+            if block.type == "tool_use":
+                result = dict(block.input)
+                result.setdefault("page", page_num)
+
+                # Occasionally the model serializes "elements" as a JSON string
+                # instead of a true nested array, even under tool-use — and
+                # since that string is itself hand-written JSON, it can carry
+                # the exact same unescaped-quote breakage as the freeform path.
+                # Use the tolerant per-object extractor rather than a strict
+                # json.loads so one bad element doesn't sink the whole page.
+                elements = result.get("elements", [])
+                if isinstance(elements, str):
+                    recovered = _extract_json_objects(elements)
+                    if recovered:
+                        print(f"  [info] Recovered {len(recovered)} element(s) from a "
+                              f"stringified 'elements' field on page {page_num}")
+                    # An empty recovery from a non-trivial string is a real
+                    # failure (caller retries); from a near-empty string it's
+                    # legitimately just an empty page.
+                    elements = recovered if (recovered or len(elements) < 20) else None
+                result["elements"] = elements if isinstance(elements, list) else None
+                return result
+
+        # Model didn't call the tool (shouldn't happen with tool_choice forced) —
+        # fall back to parsing whatever text it produced instead.
+        text = "".join(b.text for b in response.content if getattr(b, "type", None) == "text")
+        parsed = parse_json_response(text, page_num)
+        parsed["elements"] = parsed.get("elements") or None
+        return parsed
+
+    result = _call()
+    if result.get("elements") is None:
+        print(f"  [warn] Claude returned malformed 'elements' on page {page_num} — retrying once")
+        result = _call()
+    result["elements"] = result.get("elements") or []
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -639,11 +775,24 @@ def analyze_with_mock(pdf_path: str, page_num: int, text_hint: str = "") -> dict
             if rows:
                 elements.append({"type": "table", "rows": rows})
 
-        # Remaining lines as paragraphs
+        # Remaining lines as paragraphs — skip lines already captured in a
+        # table cell, otherwise the same text becomes two competing elements
+        # (a table header cell and a near-duplicate paragraph) for the same
+        # content-stream block, and the paragraph tends to win the match.
+        table_words: set[str] = set()
+        for elem in elements:
+            if elem["type"] == "table":
+                for row in elem["rows"]:
+                    for cell in row["cells"]:
+                        table_words.update(str(cell).lower().split())
+
         for line in lines:
-            if line not in used_as_heading and len(line) > 2:
-                # Skip lines that are likely already captured in tables
-                elements.append({"type": "paragraph", "text": line})
+            if line in used_as_heading or len(line) <= 2:
+                continue
+            lwords = set(line.lower().split())
+            if lwords and len(lwords & table_words) / len(lwords) > 0.6:
+                continue
+            elements.append({"type": "paragraph", "text": line})
 
     return {"page": page_num, "elements": elements}
 
@@ -709,12 +858,52 @@ def analyze_page(
 
     if result is None:
         result = analyze_with_mock(pdf_path, page_num, text_hint)
+    else:
+        # AI table extraction can lose rows on unusually dense tables (e.g. a
+        # JSON-escaping failure mid-table). pdfplumber's deterministic
+        # extraction doesn't suffer that failure mode — use it to backstop
+        # completeness when the AI's row count looks suspiciously low.
+        result["elements"] = _backstop_table_rows(pdf_path, page_num, result.get("elements", []))
 
     # Attach real image bytes to image elements
     if page_images:
         result["elements"] = _attach_images_to_elements(result.get("elements", []), page_images)
 
     return result
+
+
+def _backstop_table_rows(pdf_path: str, page_num: int, elements: list[dict]) -> list[dict]:
+    """If an AI-extracted table has noticeably fewer rows than pdfplumber's own
+    extraction of the same page, prefer pdfplumber's rows for completeness.
+
+    Matches AI tables to pdfplumber tables by page order — a heuristic, not an
+    identity match, but safe: it only overwrites AI rows when an independent
+    extraction found substantially more content, never the reverse.
+    """
+    ai_tables = [e for e in elements if e.get("type") == "table"]
+    if not ai_tables:
+        return elements
+
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            pf_tables = pdf.pages[page_num - 1].extract_tables()
+    except Exception:
+        return elements
+
+    for elem, pf_table in zip(ai_tables, pf_tables):
+        if not pf_table:
+            continue
+        pf_rows = [row for row in pf_table if any(str(c or "").strip() for c in row)]
+        ai_rows = elem.get("rows", [])
+        if len(pf_rows) >= 4 and len(pf_rows) > len(ai_rows) * 1.5:
+            print(f"  [info] Table on page {page_num}: AI extracted {len(ai_rows)} row(s), "
+                  f"pdfplumber found {len(pf_rows)} — using pdfplumber's rows for completeness")
+            elem["rows"] = [
+                {"is_header": r_idx == 0, "cells": [str(c or "").strip() for c in row]}
+                for r_idx, row in enumerate(pf_rows)
+            ]
+
+    return elements
 
 
 # ---------------------------------------------------------------------------
@@ -788,6 +977,7 @@ def set_page_size(section, width_in: float, height_in: float):
 
 
 def build_docx(pages_data: list[dict], output_path: str, page_dims: list[tuple[float, float]] | None = None, title: str = ""):
+    _normalize_heading_levels(pages_data)
     doc = Document()
     doc.core_properties.title = title or Path(output_path).stem.replace("_", " ").title()
     doc.core_properties.language = "en-US"
@@ -972,28 +1162,56 @@ def _find_content_blocks(instructions) -> list[dict]:
     return blocks
 
 
-def _match_blocks_to_elements(blocks: list[dict], elements: list[dict]) -> dict[int, tuple[str, int]]:
+def _match_blocks_to_elements(blocks: list[dict], elements: list[dict]) -> dict[int, tuple[str, int, dict | None]]:
     """
     Match content-stream blocks to Claude-extracted elements by text overlap.
-    Returns {block_index: (tag_name, local_mcid)}.
+    Returns {block_index: (tag_name, local_mcid, group)}.
+
+    Tables and lists are expanded into one candidate per cell/item (rather than
+    one candidate for the whole table/list) so each cell's content block can be
+    matched independently — a table is many text blocks, not one. `group`
+    carries enough info (group type/id, row index, header flag) for the caller
+    to reassemble the proper Table>TR>TH/TD or L>LI nesting.
     """
-    TYPE_MAP = {
-        'paragraph': 'P', 'table': 'Table',
-        'list': 'L', 'caption': 'Caption', 'image_alt': 'Figure',
-    }
+    TYPE_MAP = {'paragraph': 'P', 'caption': 'Caption', 'image_alt': 'Figure'}
 
     elem_info = []
+    group_seq = 0
     for elem in elements:
         etype = elem.get('type', 'paragraph')
-        text = elem.get('text', '').strip()
-        level = elem.get('level', 1)
-        tag = f'H{max(1, min(6, level))}' if etype == 'heading' else TYPE_MAP.get(etype, 'P')
-        if etype == 'table':
+        if etype == 'heading':
+            level = elem.get('level', 1)
+            text = elem.get('text', '').strip()
+            elem_info.append({'tag': f'H{max(1, min(6, level))}', 'text': text.lower(), 'group': None})
+        elif etype == 'table':
             rows = elem.get('rows', [])
-            text = ' '.join(str(c) for c in rows[0].get('cells', [])) if rows else ''
+            if not rows:
+                continue
+            gid = group_seq; group_seq += 1
+            for r_idx, row in enumerate(rows):
+                is_header = row.get('is_header', r_idx == 0)
+                for cell_text in row.get('cells', []):
+                    cell_text = str(cell_text).strip()
+                    if not cell_text:
+                        continue
+                    elem_info.append({
+                        'tag': 'TH' if is_header else 'TD',
+                        'text': cell_text.lower(),
+                        'group': {'type': 'Table', 'id': gid, 'row': r_idx},
+                    })
         elif etype == 'list':
-            text = ' '.join(elem.get('items', [])[:3])
-        elem_info.append({'tag': tag, 'text': text.lower().strip()})
+            items = elem.get('items', [])
+            if not items:
+                continue
+            gid = group_seq; group_seq += 1
+            for item_text in items:
+                item_text = str(item_text).strip()
+                if not item_text:
+                    continue
+                elem_info.append({'tag': 'LI', 'text': item_text.lower(), 'group': {'type': 'L', 'id': gid}})
+        else:
+            text = elem.get('text', '').strip()
+            elem_info.append({'tag': TYPE_MAP.get(etype, 'P'), 'text': text.lower(), 'group': None})
 
     assignments = {}
     used_elements = set()
@@ -1001,7 +1219,7 @@ def _match_blocks_to_elements(blocks: list[dict], elements: list[dict]) -> dict[
 
     for block_idx, block in enumerate(blocks):
         if block['type'] == 'image':
-            assignments[block_idx] = ('Figure', mcid)
+            assignments[block_idx] = ('Figure', mcid, None)
             mcid += 1
             continue
 
@@ -1016,13 +1234,19 @@ def _match_blocks_to_elements(blocks: list[dict], elements: list[dict]) -> dict[
             bwords = set(block_text.split())
             ewords = set(elem['text'].split())
             overlap = len(bwords & ewords)
-            score = overlap / max(len(bwords), len(ewords))
-            if score > best_score and score > 0.2:
+            # Containment (overlap / smaller set), not Jaccard (overlap / larger
+            # set) — a content-stream block is often a single line, while a
+            # matching element (e.g. a multi-line table header cell) can span
+            # several lines. Dividing by the larger set systematically
+            # under-scores true matches when the two text lengths differ a lot.
+            score = overlap / min(len(bwords), len(ewords))
+            if score > best_score and score > 0.5:
                 best_score = score
                 best_elem = ei
 
         if best_elem is not None:
-            assignments[block_idx] = (elem_info[best_elem]['tag'], mcid)
+            chosen = elem_info[best_elem]
+            assignments[block_idx] = (chosen['tag'], mcid, chosen['group'])
             used_elements.add(best_elem)
             mcid += 1
 
@@ -1038,7 +1262,7 @@ def _strip_marked_content(instructions) -> list:
     return [i for i in instructions if str(i.operator) not in ('BDC', 'BMC', 'EMC')]
 
 
-def _inject_mcids(instructions, blocks: list[dict], assignments: dict[int, tuple[str, int]]) -> list:
+def _inject_mcids(instructions, blocks: list[dict], assignments: dict[int, tuple[str, int, dict | None]]) -> list:
     """Wrap every content item in a BDC/EMC sequence.
 
     - Matched blocks  → struct BDC with MCID (real tagged content)
@@ -1080,7 +1304,7 @@ def _inject_mcids(instructions, blocks: list[dict], assignments: dict[int, tuple
                 in_artifact = False
 
             if bi in assignments:
-                tag_name, mcid_val = assignments[bi]
+                tag_name, mcid_val, _group = assignments[bi]
                 new_instrs.append(struct_bdc(tag_name, mcid_val))
             else:
                 new_instrs.append(artifact_bdc)
@@ -1174,6 +1398,29 @@ def _build_outlines(pdf, pages_data: list[dict]) -> None:
     pdf.Root['/PageMode']  = Name('/UseOutlines')
 
 
+def _normalize_heading_levels(pages_data: list[dict]) -> None:
+    """Normalize heading levels across the whole document so there are no
+    gaps (e.g. a document-wide H1 -> H3 becomes H1 -> H2), mutating elements
+    in place.
+
+    Each page is analyzed independently (by the AI or the font-size
+    heuristic), so a page's local heading judgment can disagree with the
+    level the previous page left off at — a sub-heading on page 2 might get
+    judged H3 in isolation even though the document never used H2 to get
+    there.
+    """
+    max_seen = 0
+    for page in pages_data:
+        for elem in page.get("elements", []):
+            if elem.get("type") != "heading":
+                continue
+            level = max(1, min(6, elem.get("level", 1)))
+            if level > max_seen + 1:
+                level = max_seen + 1
+            elem["level"] = level
+            max_seen = max(max_seen, level)
+
+
 def tag_pdf_with_accessibility(
     source_pdf: str,
     pages_data: list[dict],
@@ -1191,6 +1438,7 @@ def tag_pdf_with_accessibility(
     """
     from pikepdf import Dictionary, Array, Name, String, Integer as PikInt
 
+    _normalize_heading_levels(pages_data)
     doc_title = title or Path(source_pdf).stem.replace("_", " ").title()
 
     with pikepdf.open(source_pdf) as pdf:
@@ -1219,10 +1467,6 @@ def tag_pdf_with_accessibility(
 
         all_struct_elems = []   # flattened list for the Document StructElem
         page_parent_arrays = [] # one Array per tagged page for the ParentTree
-
-        # Table and L are grouping elements — they cannot directly contain MCRs.
-        # Remap them to safe leaf types to avoid "Content in inadmissible location".
-        GROUPING_REMAP = {'Table': 'Caption', 'L': 'P'}
 
         for page_idx, page_data in enumerate(pages_data):
             if page_idx >= len(pdf.pages):
@@ -1261,24 +1505,78 @@ def tag_pdf_with_accessibility(
             page_bbox = [float(mb[0]), float(mb[1]), float(mb[2]), float(mb[3])]
 
             # Build struct elements; keep a slot-indexed array for the ParentTree
-            max_local_mcid = max(lm for _, lm in assignments.values())
+            max_local_mcid = max(lm for _, lm, _ in assignments.values())
             parent_slot: list = [None] * (max_local_mcid + 1)
 
-            for block_idx, (tag_name, local_mcid) in assignments.items():
-                # Remap grouping types to safe leaf types
-                safe_tag = GROUPING_REMAP.get(tag_name, tag_name)
+            # Table/List are grouping elements that cannot directly contain MCRs
+            # (Matterhorn "content in inadmissible location"). Their leaf cells
+            # (TH/TD) or items (LI > LBody) hold the MCRs; the group elements are
+            # finalized below once all of their children have been collected.
+            table_groups: dict[int, dict] = {}   # group_id -> {ref, rows: {row_idx: {ref, cells}}}
+            list_groups: dict[int, dict] = {}    # group_id -> {ref, items: [li_ref, ...]}
+
+            for block_idx, (tag_name, local_mcid, group) in assignments.items():
                 mcr = pdf.make_indirect(Dictionary(
                     Type=Name('/MCR'),
                     Pg=page_obj.obj,
                     MCID=PikInt(local_mcid),
                 ))
+
+                if group and group['type'] == 'Table':
+                    gid = group['id']
+                    if gid not in table_groups:
+                        table_ref = pdf.make_indirect(Dictionary(
+                            Type=Name('/StructElem'), S=Name('/Table'), Pg=page_obj.obj,
+                        ))
+                        table_groups[gid] = {'ref': table_ref, 'rows': {}}
+                        all_struct_elems.append(table_ref)
+                    tg = table_groups[gid]
+                    row_idx = group['row']
+                    if row_idx not in tg['rows']:
+                        tr_ref = pdf.make_indirect(Dictionary(
+                            Type=Name('/StructElem'), S=Name('/TR'), Pg=page_obj.obj,
+                        ))
+                        tg['rows'][row_idx] = {'ref': tr_ref, 'cells': []}
+                    row = tg['rows'][row_idx]
+                    cell_d = Dictionary(
+                        Type=Name('/StructElem'), S=Name(f'/{tag_name}'), Pg=page_obj.obj,
+                        K=Array([mcr]),
+                    )
+                    if tag_name == 'TH':
+                        cell_d['/A'] = pdf.make_indirect(Dictionary(O=Name('/Table'), Scope=Name('/Column')))
+                    cell_ref = pdf.make_indirect(cell_d)
+                    cell_ref['/P'] = row['ref']
+                    row['cells'].append(cell_ref)
+                    parent_slot[local_mcid] = cell_ref
+                    continue
+
+                if group and group['type'] == 'L':
+                    gid = group['id']
+                    if gid not in list_groups:
+                        list_ref = pdf.make_indirect(Dictionary(
+                            Type=Name('/StructElem'), S=Name('/L'), Pg=page_obj.obj,
+                        ))
+                        list_groups[gid] = {'ref': list_ref, 'items': []}
+                        all_struct_elems.append(list_ref)
+                    lg = list_groups[gid]
+                    lbody_ref = pdf.make_indirect(Dictionary(
+                        Type=Name('/StructElem'), S=Name('/LBody'), Pg=page_obj.obj, K=Array([mcr]),
+                    ))
+                    li_ref = pdf.make_indirect(Dictionary(
+                        Type=Name('/StructElem'), S=Name('/LI'), Pg=page_obj.obj, K=Array([lbody_ref]),
+                    ))
+                    lbody_ref['/P'] = li_ref
+                    li_ref['/P'] = lg['ref']
+                    lg['items'].append(li_ref)
+                    parent_slot[local_mcid] = lbody_ref
+                    continue
+
                 struct_d = Dictionary(
                     Type=Name('/StructElem'),
-                    S=Name(f'/{safe_tag}'),
+                    S=Name(f'/{tag_name}'),
                     Pg=page_obj.obj,
                     K=Array([mcr]),
                 )
-                tag_name = safe_tag  # use safe name for subsequent checks
                 if tag_name == 'Figure':
                     # /Alt is required; /BBox prevents Matterhorn 17-002 failures
                     alt = ''
@@ -1297,6 +1595,18 @@ def tag_pdf_with_accessibility(
                 struct_ref = pdf.make_indirect(struct_d)
                 parent_slot[local_mcid] = struct_ref
                 all_struct_elems.append(struct_ref)
+
+            # Finalize grouping elements now that all children are collected
+            for tg in table_groups.values():
+                row_refs = []
+                for row_idx in sorted(tg['rows'].keys()):
+                    row = tg['rows'][row_idx]
+                    row['ref']['/K'] = Array(row['cells'])
+                    row['ref']['/P'] = tg['ref']
+                    row_refs.append(row['ref'])
+                tg['ref']['/K'] = Array(row_refs)
+            for lg in list_groups.values():
+                lg['ref']['/K'] = Array(lg['items'])
 
             # Wire up StructParents: page points to its index in the ParentTree
             tree_idx = len(page_parent_arrays)
@@ -1460,32 +1770,50 @@ def make_docx_accessible(docx_path: str, pages_data: list[dict]) -> None:
             elif any(text in ht or ht in text for ht in all_header_texts):
                 paras_to_remove.append(para)
 
-        if all_footer_texts:
-            footer_text = " | ".join(dict.fromkeys(all_footer_texts))
-            footer_page_indices = set(page_footer_texts.keys())
-            all_page_indices = set(range(len(pages_data)))
+        # pdf2docx gives one section per source page, so when footer/header text
+        # actually differs page-to-page (e.g. "Page 1 of 4" vs "Page 2 of 4") we
+        # can set each section's own value. The build_docx fallback only adds a
+        # section when page *size* changes, so it won't generally line up with
+        # pages 1:1 — guard with this check rather than assume the mapping holds.
+        per_page_sections = len(doc.sections) == len(pages_data)
 
-            if footer_page_indices == {0} or footer_page_indices.issubset({0}):
-                # Footer only on first page — use Word's "different first page" feature
-                section.different_first_page_header_footer = True
-                section.first_page_footer.is_linked_to_previous = False
-                section.first_page_footer.paragraphs[0].text = footer_text
+        if all_footer_texts:
+            footer_page_indices = set(page_footer_texts.keys())
+            varies_by_page = len({tuple(v) for v in page_footer_texts.values()}) > 1
+
+            if varies_by_page and per_page_sections:
+                for pi, sec in enumerate(doc.sections):
+                    sec.footer.is_linked_to_previous = False
+                    sec.footer.paragraphs[0].text = " | ".join(dict.fromkeys(page_footer_texts.get(pi, [])))
             else:
-                # Footer on multiple/all pages — set as section-wide footer
-                section.footer.is_linked_to_previous = False
-                section.footer.paragraphs[0].text = footer_text
+                footer_text = " | ".join(dict.fromkeys(all_footer_texts))
+                if footer_page_indices.issubset({0}):
+                    # Footer only on first page — use Word's "different first page" feature
+                    section.different_first_page_header_footer = True
+                    section.first_page_footer.is_linked_to_previous = False
+                    section.first_page_footer.paragraphs[0].text = footer_text
+                else:
+                    # Same footer text on every page — set as section-wide footer
+                    section.footer.is_linked_to_previous = False
+                    section.footer.paragraphs[0].text = footer_text
 
         if all_header_texts:
-            header_text = " ".join(dict.fromkeys(all_header_texts))
             header_page_indices = set(page_header_texts.keys())
+            varies_by_page = len({tuple(v) for v in page_header_texts.values()}) > 1
 
-            if header_page_indices == {0} or header_page_indices.issubset({0}):
-                section.different_first_page_header_footer = True
-                section.first_page_header.is_linked_to_previous = False
-                section.first_page_header.paragraphs[0].text = header_text
+            if varies_by_page and per_page_sections:
+                for pi, sec in enumerate(doc.sections):
+                    sec.header.is_linked_to_previous = False
+                    sec.header.paragraphs[0].text = " ".join(dict.fromkeys(page_header_texts.get(pi, [])))
             else:
-                section.header.is_linked_to_previous = False
-                section.header.paragraphs[0].text = header_text
+                header_text = " ".join(dict.fromkeys(all_header_texts))
+                if header_page_indices.issubset({0}):
+                    section.different_first_page_header_footer = True
+                    section.first_page_header.is_linked_to_previous = False
+                    section.first_page_header.paragraphs[0].text = header_text
+                else:
+                    section.header.is_linked_to_previous = False
+                    section.header.paragraphs[0].text = header_text
 
         for para in paras_to_remove:
             para._element.getparent().remove(para._element)
