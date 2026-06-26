@@ -308,6 +308,11 @@ HEADINGS:
 - H2 = main sections or chapters. H3–H6 = subsections. Never skip levels (no H1→H3).
 - Only tag text as a heading if it visually defines a section. A different font or color alone does not make a heading.
 - Heading levels must follow a strict logical progression with no gaps.
+- On government forms, field numbers/letters and their labels (e.g. "5.a.", "24.", "Item Number 12.",
+  "12.b. Given Name") are NOT headings, even when bold, boxed, or in a larger font — tag them as
+  "paragraph" (or as table cells if they sit inside a form grid). A heading is a substantive multi-word
+  section or subsection title (e.g. "Part 2. Information About You"), never a bare number/letter or a
+  single short field label.
 
 PARAGRAPHS:
 - Use type "paragraph" for body text, standalone text, and plain decorative text that is not a heading.
@@ -564,6 +569,7 @@ def analyze_with_claude(pdf_path: str, page_num: int, text_hint: str = "", image
         response = client.messages.create(
             model=CLAUDE_MODEL,
             max_tokens=8192,
+            temperature=0,
             system=SYSTEM_PROMPT,
             tools=[PAGE_ELEMENTS_TOOL],
             tool_choice={"type": "tool", "name": "emit_page_elements"},
@@ -903,6 +909,26 @@ def _backstop_table_rows(pdf_path: str, page_num: int, elements: list[dict]) -> 
                 for r_idx, row in enumerate(pf_rows)
             ]
 
+    # A table with exactly one row has no header/data distinction to make —
+    # that row IS the header (e.g. a strip of form-field labels with no data
+    # row beneath). The AI sometimes still marks it is_header: false, which
+    # leaves the table with zero TH cells and fails accessibility checks.
+    for elem in ai_tables:
+        rows = elem.get("rows", [])
+        if len(rows) == 1:
+            rows[0]["is_header"] = True
+
+    # Some dense form-field grids (e.g. every row is itself a strip of field
+    # captions like "Prefix | First | Middle | Last") have no row that visually
+    # reads as a header, so the AI marks every row is_header: false — leaving
+    # the whole table with zero TH cells. A table needs at least one header
+    # row to satisfy Section 508/PDF-UA, so default to the first row when the
+    # AI didn't designate any.
+    for elem in ai_tables:
+        rows = elem.get("rows", [])
+        if rows and not any(r.get("is_header") for r in rows):
+            rows[0]["is_header"] = True
+
     return elements
 
 
@@ -1162,16 +1188,24 @@ def _find_content_blocks(instructions) -> list[dict]:
     return blocks
 
 
-def _match_blocks_to_elements(blocks: list[dict], elements: list[dict]) -> dict[int, tuple[str, int, dict | None]]:
+def _match_blocks_to_elements(blocks: list[dict], elements: list[dict]) -> dict[int, tuple[str, int, dict | None, int]]:
     """
     Match content-stream blocks to Claude-extracted elements by text overlap.
-    Returns {block_index: (tag_name, local_mcid, group)}.
+    Returns {block_index: (tag_name, local_mcid, group, elem_order)}.
 
     Tables and lists are expanded into one candidate per cell/item (rather than
     one candidate for the whole table/list) so each cell's content block can be
     matched independently — a table is many text blocks, not one. `group`
     carries enough info (group type/id, row index, header flag) for the caller
     to reassemble the proper Table>TR>TH/TD or L>LI nesting.
+
+    `elem_order` is the matched element's index in `elements` (already in the
+    AI's linearized reading order per the system prompt's READING ORDER rule).
+    Content-stream block order does NOT reliably match visual reading order on
+    fillable forms — form software often writes field widgets/labels to the
+    stream in field-definition order rather than top-to-bottom order — so the
+    caller must build the struct tree (and therefore heading order) from
+    `elem_order`, not from `block_idx`.
     """
     TYPE_MAP = {'paragraph': 'P', 'caption': 'Caption', 'image_alt': 'Figure'}
 
@@ -1219,7 +1253,11 @@ def _match_blocks_to_elements(blocks: list[dict], elements: list[dict]) -> dict[
 
     for block_idx, block in enumerate(blocks):
         if block['type'] == 'image':
-            assignments[block_idx] = ('Figure', mcid, None)
+            # No elem_info entry to anchor reading order to — fall back to
+            # placing it after all named elements, ordered by its own stream
+            # position among other such images (images are rare on the dense
+            # forms where stream order diverges from reading order).
+            assignments[block_idx] = ('Figure', mcid, None, len(elem_info) + block_idx)
             mcid += 1
             continue
 
@@ -1246,8 +1284,47 @@ def _match_blocks_to_elements(blocks: list[dict], elements: list[dict]) -> dict[
 
         if best_elem is not None:
             chosen = elem_info[best_elem]
-            assignments[block_idx] = (chosen['tag'], mcid, chosen['group'])
+            assignments[block_idx] = (chosen['tag'], mcid, chosen['group'], best_elem)
             used_elements.add(best_elem)
+            mcid += 1
+
+    # Second pass: header-row (TH) and heading (H1-H6) candidates are
+    # structurally critical — a table with zero TH tags fails Section 508
+    # even if every data cell tagged correctly, and a heading that's dropped
+    # entirely (rather than mis-leveled) shows up as a level *skip* between
+    # whichever headings on either side of it did get tagged. Dense forms
+    # often split a cell or heading's text across many tiny content-stream
+    # fragments (single words, sometimes single tokens), so a candidate can
+    # legitimately fail the stricter 0.5 containment bar against every
+    # fragment and end up completely untagged. Retry just the still-unmatched
+    # TH/heading candidates against still-unmatched blocks with a relaxed
+    # threshold — bounded to those tags and unused blocks/elements so it
+    # can't disturb assignments already resolved above.
+    _critical_tags = {'TH'} | {f'H{i}' for i in range(1, 7)}
+    unmatched_blocks = [
+        bi for bi, b in enumerate(blocks)
+        if bi not in assignments and b['type'] == 'text' and b.get('text', '').strip()
+    ]
+    for ei, elem in enumerate(elem_info):
+        if ei in used_elements or elem['tag'] not in _critical_tags or not elem['text']:
+            continue
+        ewords = set(elem['text'].split())
+        if not ewords:
+            continue
+        best_block, best_score = None, 0
+        for bi in unmatched_blocks:
+            bwords = set(blocks[bi]['text'].lower().strip().split())
+            if not bwords:
+                continue
+            overlap = len(bwords & ewords)
+            score = overlap / min(len(bwords), len(ewords))
+            if score > best_score and score > 0.25:
+                best_score = score
+                best_block = bi
+        if best_block is not None:
+            assignments[best_block] = (elem['tag'], mcid, elem['group'], ei)
+            used_elements.add(ei)
+            unmatched_blocks.remove(best_block)
             mcid += 1
 
     return assignments
@@ -1262,7 +1339,7 @@ def _strip_marked_content(instructions) -> list:
     return [i for i in instructions if str(i.operator) not in ('BDC', 'BMC', 'EMC')]
 
 
-def _inject_mcids(instructions, blocks: list[dict], assignments: dict[int, tuple[str, int, dict | None]]) -> list:
+def _inject_mcids(instructions, blocks: list[dict], assignments: dict[int, tuple[str, int, dict | None, int]]) -> list:
     """Wrap every content item in a BDC/EMC sequence.
 
     - Matched blocks  → struct BDC with MCID (real tagged content)
@@ -1304,7 +1381,7 @@ def _inject_mcids(instructions, blocks: list[dict], assignments: dict[int, tuple
                 in_artifact = False
 
             if bi in assignments:
-                tag_name, mcid_val, _group = assignments[bi]
+                tag_name, mcid_val, _group, _elem_order = assignments[bi]
                 new_instrs.append(struct_bdc(tag_name, mcid_val))
             else:
                 new_instrs.append(artifact_bdc)
@@ -1398,27 +1475,54 @@ def _build_outlines(pdf, pages_data: list[dict]) -> None:
     pdf.Root['/PageMode']  = Name('/UseOutlines')
 
 
+_FIELD_NUM_RE = re.compile(r'\d{1,3}\.[a-zA-Z]{0,2}\.?')
+
+
+def _looks_like_field_label(text: str) -> bool:
+    """True for form-field reference numbers/letters (e.g. "24.", "5.a.",
+    or multi-column-merge artifacts like "5.a.12.a.") that vision models on
+    dense government forms routinely mis-tag as headings because the field
+    number is bold or boxed. A real heading reads as a title; these don't."""
+    stripped = _FIELD_NUM_RE.sub('', text).strip(' .()')
+    if not stripped:
+        return True  # nothing left but number/letter references
+    if len(_FIELD_NUM_RE.findall(text)) >= 2:
+        return True  # two+ field-number tokens glued together
+    return False
+
+
 def _normalize_heading_levels(pages_data: list[dict]) -> None:
     """Normalize heading levels across the whole document so there are no
     gaps (e.g. a document-wide H1 -> H3 becomes H1 -> H2), mutating elements
-    in place.
+    in place. Also demotes mis-tagged field-label "headings" to paragraphs
+    first, so they don't consume a level or create phantom gaps.
 
     Each page is analyzed independently (by the AI or the font-size
     heuristic), so a page's local heading judgment can disagree with the
     level the previous page left off at — a sub-heading on page 2 might get
     judged H3 in isolation even though the document never used H2 to get
     there.
+
+    Clamps against the *immediately preceding* heading's level, not the
+    deepest level ever seen — a document-wide high-water mark would let a
+    later H2 -> H4 through unclamped once H3 had appeared anywhere earlier,
+    even though that's still a skip relative to its own immediate neighbor
+    (which is what accessibility checkers actually flag).
     """
-    max_seen = 0
+    prev_level = 0
     for page in pages_data:
         for elem in page.get("elements", []):
             if elem.get("type") != "heading":
                 continue
+            if _looks_like_field_label(elem.get("text", "")):
+                elem["type"] = "paragraph"
+                elem.pop("level", None)
+                continue
             level = max(1, min(6, elem.get("level", 1)))
-            if level > max_seen + 1:
-                level = max_seen + 1
+            if level > prev_level + 1:
+                level = prev_level + 1
             elem["level"] = level
-            max_seen = max(max_seen, level)
+            prev_level = level
 
 
 def tag_pdf_with_accessibility(
@@ -1505,7 +1609,7 @@ def tag_pdf_with_accessibility(
             page_bbox = [float(mb[0]), float(mb[1]), float(mb[2]), float(mb[3])]
 
             # Build struct elements; keep a slot-indexed array for the ParentTree
-            max_local_mcid = max(lm for _, lm, _ in assignments.values())
+            max_local_mcid = max(lm for _, lm, _, _ in assignments.values())
             parent_slot: list = [None] * (max_local_mcid + 1)
 
             # Table/List are grouping elements that cannot directly contain MCRs
@@ -1515,7 +1619,18 @@ def tag_pdf_with_accessibility(
             table_groups: dict[int, dict] = {}   # group_id -> {ref, rows: {row_idx: {ref, cells}}}
             list_groups: dict[int, dict] = {}    # group_id -> {ref, items: [li_ref, ...]}
 
-            for block_idx, (tag_name, local_mcid, group) in assignments.items():
+            # Iterate in elem_order (the AI's linearized reading order), not
+            # block_idx (content-stream position) — on fillable forms, field
+            # widgets/labels are often written to the content stream in
+            # field-definition order rather than top-to-bottom visual order,
+            # so block order is not a reliable proxy for reading order. Using
+            # the AI's already-linearized order also avoids the dict-
+            # insertion-order issue where the relaxed second pass in
+            # _match_blocks_to_elements appends matches regardless of page
+            # position.
+            for block_idx, (tag_name, local_mcid, group, _elem_order) in sorted(
+                assignments.items(), key=lambda kv: kv[1][3]
+            ):
                 mcr = pdf.make_indirect(Dictionary(
                     Type=Name('/MCR'),
                     Pg=page_obj.obj,
@@ -1618,6 +1733,25 @@ def tag_pdf_with_accessibility(
             pdf.save(output_path)
             return
 
+        # Re-clamp heading levels against the sequence that actually made it
+        # into the struct tree. _normalize_heading_levels already made
+        # pages_data gap-free, but block-matching can legitimately drop a
+        # heading entirely (e.g. banner/title text baked into a logo image,
+        # with no extractable text run in the content stream to attach an
+        # MCID to) — leaving a gap between whichever headings on either side
+        # did get tagged. Re-clamping against survivors only is the same fix
+        # already applied to the docx heading pass in make_docx_accessible.
+        prev_level = 0
+        for ref in all_struct_elems:
+            sname = str(ref.get('/S', ''))
+            if not re.fullmatch(r'/H[1-6]', sname):
+                continue
+            level = int(sname[2])
+            if level > prev_level + 1:
+                level = prev_level + 1
+                ref['/S'] = Name(f'/H{level}')
+            prev_level = level
+
         doc_elem = pdf.make_indirect(Dictionary(
             Type=Name('/StructElem'),
             S=Name('/Document'),
@@ -1652,6 +1786,39 @@ def tag_pdf_with_accessibility(
 # Shared DOCX conversion (used by both CLI and web job)
 # ---------------------------------------------------------------------------
 
+def _iter_block_items(container):
+    """Yield paragraphs and tables in true document order (as they appear in
+    the XML body), instead of python-docx's separate .paragraphs/.tables
+    lists which lose interleaving between the two."""
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
+    parent_elm = container.element.body if hasattr(container, "element") else container._tc
+    for child in parent_elm.iterchildren():
+        if child.tag == qn("w:p"):
+            yield Paragraph(child, container)
+        elif child.tag == qn("w:tbl"):
+            yield Table(child, container)
+
+
+def _iter_all_paragraphs(container):
+    """Yield every paragraph in a Document (or table cell) in true reading
+    order, including ones nested inside table cells. pdf2docx renders most
+    form layouts as tables, so headings routinely end up inside cells
+    interleaved with top-level body paragraphs — a naive paragraphs-then-
+    tables traversal would scramble that order and break heading-level
+    normalization."""
+    from docx.table import Table
+
+    for block in _iter_block_items(container):
+        if isinstance(block, Table):
+            for row in block.rows:
+                for cell in row.cells:
+                    yield from _iter_all_paragraphs(cell)
+        else:
+            yield block
+
+
 def make_docx_accessible(docx_path: str, pages_data: list[dict]) -> None:
     """
     Post-process a visually-converted DOCX to add semantic accessibility structure:
@@ -1666,51 +1833,102 @@ def make_docx_accessible(docx_path: str, pages_data: list[dict]) -> None:
 
     doc.core_properties.language = "en-US"
 
-    # Heading styles — detect by font size
-    sizes = []
-    for para in doc.paragraphs:
-        for run in para.runs:
-            if run.font.size:
-                sizes.append(round(run.font.size.pt, 1))
+    # Heading styles — match against the AI-extracted heading elements first.
+    # pdf2docx output only preserves font *size*, and many dense government
+    # forms mark headings with bold/caps rather than a larger point size, so
+    # a size-only heuristic finds nothing on those documents even though the
+    # AI correctly identified the headings from the page image/text. Fall
+    # back to the size heuristic only when no AI heading data is available
+    # (e.g. mock mode with no pages_data).
+    _normalize_heading_levels(pages_data)
+    heading_elems = [
+        (max(1, min(6, e.get("level", 1))), e.get("text", "").strip())
+        for page in pages_data
+        for e in page.get("elements", [])
+        if e.get("type") == "heading" and e.get("text", "").strip()
+    ]
 
-    if sizes:
-        body_size = Counter(sizes).most_common(1)[0][0]
-        heading_sizes = sorted(
-            {s for s in sizes if s >= body_size * 1.2},
-            reverse=True,
-        )[:4]
-        size_to_level = {s: i + 1 for i, s in enumerate(heading_sizes)}
+    def _heading_text_match(a: str, b: str) -> bool:
+        if a == b:
+            return True
+        # Substring containment alone produces false positives when a short
+        # heading ("Page", "Future Developments") happens to appear inside an
+        # unrelated long body paragraph — require the shorter string to make
+        # up most of the longer one before treating it as the same heading.
+        shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
+        return bool(shorter) and shorter in longer and len(shorter) >= 0.6 * len(longer)
 
-        for para in doc.paragraphs:
-            if not para.runs:
+    matched_any = False
+    if heading_elems:
+        remaining = list(heading_elems)
+        for para in _iter_all_paragraphs(doc):
+            if not remaining:
+                break
+            text = para.text.strip()
+            if not text:
                 continue
-            para_sizes = [round(r.font.size.pt, 1) for r in para.runs if r.font.size]
-            if not para_sizes:
-                continue
-            dominant = Counter(para_sizes).most_common(1)[0][0]
-            if dominant in size_to_level:
-                try:
-                    para.style = doc.styles[f"Heading {size_to_level[dominant]}"]
-                except KeyError:
-                    pass
+            for i, (level, htext) in enumerate(remaining):
+                if _heading_text_match(text, htext):
+                    try:
+                        para.style = doc.styles[f"Heading {level}"]
+                        matched_any = True
+                    except KeyError:
+                        pass
+                    del remaining[i]
+                    break
 
-        # Normalize heading levels so there are no gaps (e.g. H1 → H3 becomes H1 → H2)
-        max_seen = 0
-        for para in doc.paragraphs:
-            sname = para.style.name
-            if not sname.startswith("Heading "):
-                continue
+    if not matched_any:
+        # Fallback: detect by font size
+        sizes = []
+        for para in _iter_all_paragraphs(doc):
+            for run in para.runs:
+                if run.font.size:
+                    sizes.append(round(run.font.size.pt, 1))
+
+        if sizes:
+            body_size = Counter(sizes).most_common(1)[0][0]
+            heading_sizes = sorted(
+                {s for s in sizes if s >= body_size * 1.2},
+                reverse=True,
+            )[:4]
+            size_to_level = {s: i + 1 for i, s in enumerate(heading_sizes)}
+
+            for para in _iter_all_paragraphs(doc):
+                if not para.runs:
+                    continue
+                para_sizes = [round(r.font.size.pt, 1) for r in para.runs if r.font.size]
+                if not para_sizes:
+                    continue
+                dominant = Counter(para_sizes).most_common(1)[0][0]
+                if dominant in size_to_level:
+                    try:
+                        para.style = doc.styles[f"Heading {size_to_level[dominant]}"]
+                    except KeyError:
+                        pass
+
+    # Normalize heading levels so there are no gaps (e.g. H1 → H3 becomes
+    # H1 → H2). Needed even after AI text-matching: a heading can be present
+    # in pages_data's (already gap-free) sequence but fail to match any docx
+    # paragraph, leaving a gap in the subsequence that actually got styled.
+    # Clamp against the *immediately preceding* heading's level, not the
+    # deepest level ever seen — a high-water mark would let a later H2 → H4
+    # through unclamped once H3 had appeared anywhere earlier in the doc.
+    prev_level = 0
+    for para in _iter_all_paragraphs(doc):
+        sname = para.style.name
+        if not sname.startswith("Heading "):
+            continue
+        try:
+            level = int(sname.split()[-1])
+        except ValueError:
+            continue
+        if level > prev_level + 1:
             try:
-                level = int(sname.split()[-1])
-            except ValueError:
-                continue
-            if level > max_seen + 1:
-                try:
-                    para.style = doc.styles[f"Heading {max_seen + 1}"]
-                    level = max_seen + 1
-                except KeyError:
-                    pass
-            max_seen = max(max_seen, level)
+                para.style = doc.styles[f"Heading {prev_level + 1}"]
+                level = prev_level + 1
+            except KeyError:
+                pass
+        prev_level = level
 
     # Table header rows — mark first row of every table with w:tblHeader
     for table in doc.tables:
@@ -1876,6 +2094,15 @@ def main():
     # --- Step 1: Page count ---
     with pdfplumber.open(pdf_path) as pdf:
         total_pages = len(pdf.pages)
+    if total_pages == 0:
+        print(f"Error: {pdf_path} has no readable pages — the file is likely corrupted.")
+        sys.exit(1)
+    try:
+        with pikepdf.open(pdf_path):
+            pass
+    except pikepdf.PdfError as e:
+        print(f"Error: {pdf_path} could not be opened as a valid PDF ({e}) — the file is likely corrupted.")
+        sys.exit(1)
     pages_to_process = min(total_pages, MAX_PAGES)
     if args.pages:
         pages_to_process = min(args.pages, pages_to_process)

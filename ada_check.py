@@ -123,10 +123,42 @@ class CheckReport:
 # Layer 1: Docx structure audit
 # ---------------------------------------------------------------------------
 
+def _iter_block_items(container):
+    """Yield paragraphs and tables in true document order (as they appear in
+    the XML body), instead of python-docx's separate .paragraphs/.tables
+    lists which lose interleaving between the two."""
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
+    parent_elm = container.element.body if hasattr(container, "element") else container._tc
+    for child in parent_elm.iterchildren():
+        if child.tag == qn("w:p"):
+            yield Paragraph(child, container)
+        elif child.tag == qn("w:tbl"):
+            yield Table(child, container)
+
+
+def _iter_all_paragraphs(container):
+    """Yield every paragraph in a Document (or table cell) in true reading
+    order, including ones nested inside table cells. pdf2docx renders most
+    form layouts as tables, so headings routinely end up inside cells —
+    doc.paragraphs alone misses them, and a naive paragraphs-then-tables
+    traversal would scramble the order needed for level-skip checks."""
+    from docx.table import Table
+
+    for block in _iter_block_items(container):
+        if isinstance(block, Table):
+            for row in block.rows:
+                for cell in row.cells:
+                    yield from _iter_all_paragraphs(cell)
+        else:
+            yield block
+
+
 def check_heading_hierarchy(doc: Document, report: CheckReport):
     """Headings must not skip levels (e.g., H1 → H3 without H2)."""
     heading_levels = []
-    for para in doc.paragraphs:
+    for para in _iter_all_paragraphs(doc):
         style = para.style.name
         if style.startswith("Heading "):
             try:
@@ -259,7 +291,7 @@ def check_text_coverage(source_pdf: str, doc: Document, report: CheckReport):
 def check_empty_headings(doc: Document, report: CheckReport):
     """Headings must not be empty."""
     empty = 0
-    for para in doc.paragraphs:
+    for para in _iter_all_paragraphs(doc):
         if para.style.name.startswith("Heading ") and not para.text.strip():
             empty += 1
     if empty:
