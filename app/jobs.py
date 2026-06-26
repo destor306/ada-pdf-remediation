@@ -331,10 +331,12 @@ def _execute(job_id: str):
         job.progress = 97
         _save()
         try:
-            from ada_check import CheckReport, run_docx_checks, run_verapdf, check_visual_similarity
+            from ada_check import CheckReport, run_docx_checks, check_pdf_tags, run_verapdf, check_visual_similarity
             rpt = CheckReport(source_pdf=job.pdf_path, docx_path=job.output_path, pdf_path=job.output_pdf)
             run_docx_checks(job.pdf_path, job.output_path, rpt)
             if job.output_pdf:
+                # PDF struct tree audit — mirrors what Adobe Acrobat checks
+                check_pdf_tags(job.output_pdf, rpt)
                 run_verapdf(job.output_pdf, rpt)
                 check_visual_similarity(job.pdf_path, job.output_pdf, rpt)
             job.check_report = {

@@ -253,11 +253,35 @@ async def download_result(job_id: str, fmt: str = "pdf", user: User | None = Dep
     )
 
 
+@router.post("/audit")
+async def audit_pdf_route(body: dict):
+    """
+    Run a free accessibility audit on an uploaded (not yet remediated) PDF.
+    Body: { "upload_id": "..." }
+    Returns a visual report with highlighted page images and plain-English findings.
+    """
+    upload_id = body.get("upload_id")
+    if not upload_id:
+        raise HTTPException(400, "upload_id required")
+
+    pdf_path = UPLOAD_DIR / f"{upload_id}.pdf"
+    if not pdf_path.exists():
+        raise HTTPException(404, "Upload not found — it may have expired (files are deleted after 1 hour)")
+
+    try:
+        from app.audit import audit_pdf
+        result = audit_pdf(str(pdf_path))
+        return result
+    except Exception as e:
+        raise HTTPException(500, f"Audit failed: {e}")
+
+
 @router.post("/check")
 async def check_compliance(body: dict):
     """
-    Run ada_check.py compliance check on a completed job.
+    Run ada_check.py compliance check on a completed (remediated) job.
     Body: { "job_id": "..." }
+    Checks both DOCX structure and the PDF struct tree (same checks Acrobat runs).
     """
     job_id = body.get("job_id")
     job = get_job(job_id)
@@ -273,16 +297,22 @@ async def check_compliance(body: dict):
     try:
         import sys
         sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-        from ada_check import CheckReport, run_docx_checks
-        report = CheckReport(source_pdf=job.pdf_path, docx_path=job.output_path)
-        run_docx_checks(job.pdf_path, job.output_path, report)
+        from ada_check import CheckReport, run_docx_checks, check_pdf_tags
+        rpt = CheckReport(
+            source_pdf=job.pdf_path,
+            docx_path=job.output_path,
+            pdf_path=job.output_pdf,
+        )
+        run_docx_checks(job.pdf_path, job.output_path, rpt)
+        if job.output_pdf and Path(job.output_pdf).exists():
+            check_pdf_tags(job.output_pdf, rpt)
         result = {
             "issues": [
                 {"severity": i.severity, "category": i.category, "message": i.message}
-                for i in report.issues
+                for i in rpt.issues
             ],
-            "passed": report.passed,
-            "failed": report.failed,
+            "passed": rpt.passed,
+            "failed": rpt.failed,
         }
         job.check_report = result
         return result

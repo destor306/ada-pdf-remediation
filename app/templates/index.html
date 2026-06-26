@@ -290,6 +290,71 @@
     .btn-outline:hover { border-color: var(--blue); background: var(--blue-lt); }
     .btn-row { display: flex; gap: .6rem; flex-wrap: wrap; margin-top: 1rem; }
 
+    /* ── AUDIT PANEL ── */
+    #audit-panel { display: none; }
+    .audit-header {
+      padding: 1.25rem 1.75rem 1rem;
+      border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: .75rem;
+    }
+    .audit-header-left h3 { font-size: 1rem; font-weight: 700; margin: 0; }
+    .audit-header-left p  { font-size: .82rem; color: var(--gray); margin: .15rem 0 0; }
+    .score-chip {
+      display: flex; align-items: center; gap: .5rem;
+      background: var(--surface); border: 1.5px solid var(--border);
+      border-radius: 99px; padding: .35rem .9rem; font-weight: 700; font-size: .85rem;
+    }
+    .score-chip.fail   { border-color: #FCA5A5; background: #FEF2F2; color: #991B1B; }
+    .score-chip.warn   { border-color: #FDE68A; background: #FFFBEB; color: #92400E; }
+    .score-chip.pass   { border-color: #A7F3D0; background: var(--green-lt); color: #065F46; }
+    .audit-body {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 0;
+    }
+    @media (max-width: 640px) { .audit-body { grid-template-columns: 1fr; } }
+    .audit-pages {
+      border-right: 1px solid var(--border);
+      padding: 1rem;
+      max-height: 380px; overflow-y: auto;
+    }
+    @media (max-width: 640px) { .audit-pages { border-right: none; border-bottom: 1px solid var(--border); max-height: 240px; } }
+    .audit-page-img {
+      width: 100%; border-radius: 6px; border: 1.5px solid var(--border);
+      cursor: pointer; transition: border-color .15s;
+    }
+    .audit-page-img.active { border-color: var(--blue); box-shadow: 0 0 0 3px rgba(37,99,235,.15); }
+    .page-nav { display: flex; align-items: center; gap: .5rem; font-size: .8rem; color: var(--gray); margin-bottom: .6rem; }
+    .page-nav button { background: none; border: 1px solid var(--border); border-radius: 6px; padding: .2rem .5rem; cursor: pointer; font-size: .8rem; }
+    .page-nav button:hover { background: var(--surface); }
+    .audit-issues { padding: 1rem 1.25rem; max-height: 380px; overflow-y: auto; }
+    @media (max-width: 640px) { .audit-issues { max-height: 300px; } }
+    .issue-card {
+      padding: .65rem .9rem; border-radius: 8px; margin-bottom: .5rem;
+      cursor: pointer; transition: all .15s; border: 1.5px solid transparent;
+    }
+    .issue-card:hover { transform: translateX(2px); }
+    .issue-card.error   { background: #FEF2F2; border-color: #FCA5A5; }
+    .issue-card.warning { background: #FFFBEB; border-color: #FDE68A; }
+    .issue-card.info    { background: #EFF6FF; border-color: #BFDBFE; }
+    .issue-card.active  { box-shadow: 0 0 0 2px var(--blue); }
+    .issue-card.pulse   { animation: pulse-border .5s ease; }
+    @keyframes pulse-border {
+      0%   { box-shadow: 0 0 0 0 rgba(37,99,235,.5); }
+      70%  { box-shadow: 0 0 0 6px rgba(37,99,235,0); }
+      100% { box-shadow: 0 0 0 0 rgba(37,99,235,0); }
+    }
+    .issue-icon { font-size: 1rem; margin-right: .35rem; }
+    .issue-title { font-weight: 700; font-size: .85rem; }
+    .issue-desc  { font-size: .78rem; color: var(--slate); margin-top: .2rem; line-height: 1.45; }
+    .issue-page  { font-size: .73rem; color: var(--gray); margin-top: .25rem; }
+    .section-label { font-size: .72rem; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--gray); margin: .75rem 0 .35rem; }
+    .audit-footer {
+      padding: 1rem 1.75rem;
+      border-top: 1px solid var(--border);
+      background: #FAFBFF;
+    }
+    .audit-cta-text { font-size: .82rem; color: var(--slate); margin-bottom: .6rem; }
+    .audit-cta-text strong { color: var(--navy); }
+
     /* ── PROGRESS ── */
     #progress-panel { display: none; padding: 1.75rem; }
     .progress-header { display: flex; align-items: center; gap: .75rem; margin-bottom: 1.25rem; }
@@ -640,11 +705,49 @@
           </div>
 
           <div class="btn-row">
-            <button class="btn btn-primary" id="btn-process" onclick="startProcessing()">
+            <button class="btn btn-primary" id="btn-scan" onclick="scanForIssues()">
+              <svg width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M21 21l-5.197-5.197m0 0A7.5 7.5 0 105.196 15.803 7.5 7.5 0 0016.803 15.803z"/></svg>
+              Scan for issues <span class="free-badge">FREE</span>
+            </button>
+            <button class="btn btn-outline" id="btn-process" onclick="startProcessing()">
               <svg width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09z"/></svg>
-              Remediate PDF
+              Fix it now
             </button>
             <button class="btn btn-outline" onclick="resetUpload()">Choose different file</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Audit report -->
+      <div id="audit-panel">
+        <div class="audit-header">
+          <div class="audit-header-left">
+            <h3 id="audit-title">Scanning for accessibility issues…</h3>
+            <p id="audit-subtitle"></p>
+          </div>
+          <div id="audit-score-chip" class="score-chip" style="display:none"></div>
+        </div>
+        <div class="audit-body">
+          <div class="audit-pages" id="audit-pages">
+            <div class="page-nav">
+              <button onclick="auditPrevPage()">‹</button>
+              <span id="audit-page-label">Page 1</span>
+              <button onclick="auditNextPage()">›</button>
+            </div>
+            <img id="audit-page-img" class="audit-page-img" src="" alt="PDF page preview" />
+          </div>
+          <div class="audit-issues" id="audit-issues">
+            <div style="color:var(--gray);font-size:.85rem;padding:.5rem 0;">Analyzing…</div>
+          </div>
+        </div>
+        <div class="audit-footer" id="audit-footer" style="display:none">
+          <p class="audit-cta-text" id="audit-cta-text"></p>
+          <div class="btn-row">
+            <button class="btn btn-primary" id="btn-fix-from-audit" onclick="startProcessing()">
+              <svg width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09z"/></svg>
+              Fix all issues automatically
+            </button>
+            <button class="btn btn-outline" onclick="resetUpload()">Upload different file</button>
           </div>
         </div>
       </div>
@@ -1022,9 +1125,159 @@
     } catch { showError('Network error. Please try again.'); resetDropZone(); }
   }
 
+  // ── Audit state ────────────────────────────────────────────
+  let auditPages    = [];   // [{page_num, image_b64, finding_ids}]
+  let auditFindings = [];   // all finding objects
+  let auditPageIdx  = 0;    // which page is currently shown
+
+  async function scanForIssues() {
+    if (!currentUploadId) return;
+    document.getElementById('btn-scan').disabled    = true;
+    document.getElementById('btn-process').disabled = true;
+    document.getElementById('estimate-panel').style.display = 'none';
+    dropZone.style.display = 'none';
+
+    const panel = document.getElementById('audit-panel');
+    panel.style.display = 'block';
+    document.getElementById('audit-title').textContent    = 'Scanning for accessibility issues…';
+    document.getElementById('audit-subtitle').textContent = '';
+    document.getElementById('audit-issues').innerHTML =
+      '<div style="color:var(--gray);font-size:.85rem;padding:.5rem 0;">Analyzing document structure…</div>';
+    document.getElementById('audit-page-img').src = '';
+
+    try {
+      const res  = await fetch('/api/audit', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ upload_id: currentUploadId }),
+      });
+      const data = await res.json();
+      if (!res.ok) { showAuditError(data.detail || 'Audit failed'); return; }
+      renderAuditReport(data);
+    } catch (e) {
+      showAuditError('Network error — please try again.');
+    }
+  }
+
+  function showAuditError(msg) {
+    document.getElementById('audit-title').textContent    = 'Scan failed';
+    document.getElementById('audit-subtitle').textContent = msg;
+    document.getElementById('audit-issues').innerHTML =
+      `<div style="color:#991B1B;font-size:.85rem;">${msg}</div>`;
+  }
+
+  function renderAuditReport(data) {
+    auditPages    = data.pages    || [];
+    auditFindings = data.findings || [];
+    auditPageIdx  = 0;
+
+    const errors   = auditFindings.filter(f => f.severity === 'error');
+    const warnings = auditFindings.filter(f => f.severity === 'warning');
+    const errCount = errors.length, warnCount = warnings.length;
+
+    // Header
+    document.getElementById('audit-title').textContent =
+      errCount === 0 && warnCount === 0
+        ? 'No accessibility issues found ✓'
+        : `${errCount} error${errCount !== 1 ? 's' : ''}, ${warnCount} warning${warnCount !== 1 ? 's' : ''} found`;
+    document.getElementById('audit-subtitle').textContent =
+      `Accessibility score: ${data.score}/100 · ${auditPages.length} page(s) scanned`;
+
+    const chip = document.getElementById('audit-score-chip');
+    chip.textContent = `${data.score}/100`;
+    chip.className   = `score-chip ${data.status}`;
+    chip.style.display = 'flex';
+
+    // Issue list (right panel)
+    const issuesEl = document.getElementById('audit-issues');
+    issuesEl.innerHTML = '';
+    if (auditFindings.length === 0) {
+      issuesEl.innerHTML =
+        '<div style="color:var(--green);font-size:.88rem;padding:.5rem 0;">✓ No issues detected — this PDF looks accessible.</div>';
+    } else {
+      const groups = { error: 'Critical errors', warning: 'Warnings', info: 'Notes' };
+      for (const [sev, label] of Object.entries(groups)) {
+        const group = auditFindings.filter(f => f.severity === sev);
+        if (!group.length) continue;
+        const lbl = document.createElement('div');
+        lbl.className   = 'section-label';
+        lbl.textContent = label;
+        issuesEl.appendChild(lbl);
+        group.forEach(f => {
+          const card = document.createElement('div');
+          card.className    = `issue-card ${f.severity}`;
+          card.dataset.fid  = f.id;
+          card.dataset.page = f.page || 0;
+          card.innerHTML = `
+            <div>
+              <span class="issue-icon">${f.severity === 'error' ? '🔴' : f.severity === 'warning' ? '🟠' : 'ℹ️'}</span>
+              <span class="issue-title">${f.title}</span>
+            </div>
+            <div class="issue-desc">${f.description}</div>
+            ${f.page ? `<div class="issue-page">Page ${f.page}</div>` : '<div class="issue-page">Document-level</div>'}
+          `;
+          card.addEventListener('click', () => jumpToFinding(f));
+          issuesEl.appendChild(card);
+        });
+      }
+    }
+
+    // Page image (left panel)
+    showAuditPage(0);
+
+    // Footer CTA
+    const footer = document.getElementById('audit-footer');
+    footer.style.display = 'block';
+    const cost = document.getElementById('stat-cost')?.textContent || '';
+    const ctaText = document.getElementById('audit-cta-text');
+    if (errCount === 0 && warnCount === 0) {
+      ctaText.innerHTML =
+        'Your PDF looks accessible! You can still run our full remediation to add PDF/UA tags, alt text, and a compliance report.';
+      document.getElementById('btn-fix-from-audit').textContent = 'Add PDF/UA tags & compliance report';
+    } else {
+      const total = errCount + warnCount;
+      ctaText.innerHTML =
+        `<strong>Fix all ${total} issue${total !== 1 ? 's' : ''} automatically.</strong> ` +
+        `AccessiFix adds proper tags, heading structure, alt text for every image, and table headers — ` +
+        `then generates a downloadable compliance certificate.`;
+    }
+  }
+
+  function showAuditPage(idx) {
+    if (!auditPages.length) return;
+    auditPageIdx = Math.max(0, Math.min(idx, auditPages.length - 1));
+    const pg = auditPages[auditPageIdx];
+    document.getElementById('audit-page-img').src =
+      pg.image_b64 ? `data:image/jpeg;base64,${pg.image_b64}` : '';
+    document.getElementById('audit-page-label').textContent =
+      `Page ${pg.page_num} of ${auditPages.length}`;
+  }
+
+  function auditPrevPage() { showAuditPage(auditPageIdx - 1); }
+  function auditNextPage() { showAuditPage(auditPageIdx + 1); }
+
+  function jumpToFinding(finding) {
+    // Switch to that page
+    if (finding.page) {
+      const pi = auditPages.findIndex(p => p.page_num === finding.page);
+      if (pi >= 0) showAuditPage(pi);
+    }
+    // Pulse the card
+    document.querySelectorAll('.issue-card').forEach(c => c.classList.remove('active'));
+    const card = document.querySelector(`.issue-card[data-fid="${finding.id}"]`);
+    if (card) {
+      card.classList.add('active', 'pulse');
+      card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      setTimeout(() => card.classList.remove('pulse'), 600);
+    }
+  }
+
+  // ── Remediation flow ────────────────────────────────────────
   async function startProcessing() {
     if (!currentUploadId) return;
     document.getElementById('btn-process').disabled = true;
+    if (document.getElementById('btn-scan'))
+      document.getElementById('btn-scan').disabled = true;
 
     const res  = await fetch('/api/process', {
       method: 'POST',
@@ -1038,6 +1291,7 @@
 
     currentJobId = data.job_id;
     document.getElementById('estimate-panel').style.display = 'none';
+    document.getElementById('audit-panel').style.display    = 'none';
     dropZone.style.display = 'none';
     document.getElementById('progress-panel').style.display = 'block';
     pollStatus();
@@ -1062,16 +1316,26 @@
         }
 
         if (data.status === 'done')   { clearInterval(pollTimer); showResult(data); }
-        if (data.status === 'failed') { clearInterval(pollTimer); showError('Processing failed: ' + (data.error || 'Unknown error')); document.getElementById('progress-panel').style.display = 'none'; document.getElementById('estimate-panel').style.display = 'block'; }
+        if (data.status === 'failed') {
+          clearInterval(pollTimer);
+          showError('Processing failed: ' + (data.error || 'Unknown error'));
+          document.getElementById('progress-panel').style.display = 'none';
+          document.getElementById('estimate-panel').style.display = 'block';
+        }
       } catch { /* retry */ }
     }, 2000);
   }
 
   function showResult(data) {
     document.getElementById('progress-panel').style.display = 'none';
-    document.getElementById('result-panel').style.display = 'block';
-    if (data.has_pdf)  { document.getElementById('btn-download-pdf').style.display  = 'inline-flex'; document.getElementById('validate-note').style.display = 'block'; }
-    if (data.has_docx) { document.getElementById('btn-download-docx').style.display = 'inline-flex'; }
+    document.getElementById('result-panel').style.display   = 'block';
+    if (data.has_pdf)  {
+      document.getElementById('btn-download-pdf').style.display  = 'inline-flex';
+      document.getElementById('validate-note').style.display     = 'block';
+    }
+    if (data.has_docx) {
+      document.getElementById('btn-download-docx').style.display = 'inline-flex';
+    }
     if (data.check_report) renderReport(data.check_report);
   }
 
@@ -1080,15 +1344,23 @@
     const panel = document.getElementById('report-panel');
     const list  = document.getElementById('issue-list');
     list.innerHTML = '';
-    (report.issues || []).forEach(issue => {
+    const issues = report.issues || [];
+    if (issues.length === 0) {
       const li = document.createElement('li');
-      li.textContent = issue.message;
-      li.className   = `issue-${issue.severity}`;
+      li.className   = 'issue-info';
+      li.textContent = '✓ All structure checks passed — document meets PDF/UA and Section 508 requirements.';
       list.appendChild(li);
-    });
+    } else {
+      issues.forEach(issue => {
+        const li = document.createElement('li');
+        li.textContent = issue.message;
+        li.className   = `issue-${issue.severity}`;
+        list.appendChild(li);
+      });
+    }
     const summary = document.getElementById('report-summary');
     if (report.failed === 0) {
-      summary.textContent = '✓ All structure checks passed';
+      summary.textContent = `✓ All ${report.passed} checks passed — ready to submit`;
       summary.className   = 'report-summary report-pass';
     } else {
       summary.textContent = `${report.failed} issue(s) found — review before publishing`;
@@ -1121,10 +1393,14 @@
   function resetUpload() {
     clearInterval(pollTimer);
     currentUploadId = currentJobId = null;
-    ['estimate-panel','progress-panel','result-panel','report-panel'].forEach(id => document.getElementById(id).style.display = 'none');
-    document.getElementById('error-box').style.display = 'none';
-    document.getElementById('large-doc-warning').style.display = 'none';
+    auditPages = []; auditFindings = []; auditPageIdx = 0;
+    ['estimate-panel','audit-panel','progress-panel','result-panel','report-panel']
+      .forEach(id => document.getElementById(id).style.display = 'none');
+    document.getElementById('error-box').style.display          = 'none';
+    document.getElementById('large-doc-warning').style.display  = 'none';
     document.getElementById('file-input').value = '';
+    if (document.getElementById('btn-scan'))
+      document.getElementById('btn-scan').disabled = false;
     resetDropZone();
   }
 
