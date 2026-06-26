@@ -2055,7 +2055,51 @@ def make_docx_accessible(docx_path: str, pages_data: list[dict]) -> None:
         for para in paras_to_remove:
             para._element.getparent().remove(para._element)
 
+    # Normalize multi-column sections to single-column.
+    # pdf2docx creates 2-column sections for pages that have a two-column
+    # layout (e.g. IRS instruction pages). The `nextColumn` section break
+    # that marks the column boundary is then misinterpreted by Word as a
+    # page break when the left-column content is slightly too tall, pushing
+    # the right-column content to a new page ("half page went to next page").
+    # Since the DOCX is the accessible linearised version — not a facsimile
+    # of the visual layout — converting everything to single-column and
+    # turning nextColumn breaks into nextPage breaks is the right call.
+    _fix_multicolumn_sections(doc)
+
     doc.save(docx_path)
+
+
+def _fix_multicolumn_sections(doc: Document) -> None:
+    """Convert any multi-column section to single-column, and change
+    nextColumn section-break paragraphs to nextPage so they produce a
+    clean page break instead of an overflowing column transition."""
+    from docx.oxml import OxmlElement
+
+    # 1. Fix section definitions: set every section to 1 column
+    for sec in doc.sections:
+        sectPr = sec._sectPr
+        cols = sectPr.find(qn('w:cols'))
+        if cols is not None:
+            num = int(cols.get(qn('w:num'), '1'))
+            if num > 1:
+                cols.set(qn('w:num'), '1')
+                # Remove individual column definitions if present
+                for col_elem in cols.findall(qn('w:col')):
+                    cols.remove(col_elem)
+
+    # 2. Fix section-break paragraphs: change nextColumn → nextPage
+    body = doc.element.body
+    for child in body:
+        if child.tag != qn('w:p'):
+            continue
+        sectPr = child.find('.//' + qn('w:sectPr'))
+        if sectPr is None:
+            continue
+        sec_type = sectPr.find(qn('w:type'))
+        if sec_type is not None:
+            current = sec_type.get(qn('w:val'), '')
+            if current == 'nextColumn':
+                sec_type.set(qn('w:val'), 'nextPage')
 
 
 def convert_to_docx(
