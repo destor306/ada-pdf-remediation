@@ -2087,7 +2087,11 @@ def _fix_multicolumn_sections(doc: Document) -> None:
                 for col_elem in cols.findall(qn('w:col')):
                     cols.remove(col_elem)
 
-    # 2. Fix section-break paragraphs: change nextColumn → nextPage
+    # 2. Fix section-break paragraphs: change nextColumn → continuous.
+    # nextColumn was the mid-page column transition (left col → right col).
+    # In a now-single-column layout that transition has no meaning — but
+    # changing it to nextPage would add an extra Word page break in the
+    # middle of what was one PDF page. continuous keeps the flow unbroken.
     body = doc.element.body
     for child in body:
         if child.tag != qn('w:p'):
@@ -2099,7 +2103,7 @@ def _fix_multicolumn_sections(doc: Document) -> None:
         if sec_type is not None:
             current = sec_type.get(qn('w:val'), '')
             if current == 'nextColumn':
-                sec_type.set(qn('w:val'), 'nextPage')
+                sec_type.set(qn('w:val'), 'continuous')
 
 
 def convert_to_docx(
