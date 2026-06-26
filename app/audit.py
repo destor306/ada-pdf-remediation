@@ -25,14 +25,14 @@ from PIL import Image, ImageDraw, ImageFont
 # ---------------------------------------------------------------------------
 
 _COLORS = {
-    "error":   (220, 53,  53,  90),   # red, semi-transparent fill
-    "warning": (234, 139, 0,   90),   # amber
-    "info":    (37,  99,  235, 70),   # blue
+    "error":   (220, 38,  38,  140),   # red fill, semi-transparent
+    "warning": (217, 119, 6,   140),   # amber fill
+    "info":    (37,  99,  235, 110),   # blue fill
 }
 _OUTLINE = {
-    "error":   (220, 53,  53,  220),
-    "warning": (234, 139, 0,   220),
-    "info":    (37,  99,  235, 180),
+    "error":   (185, 28,  28,  255),   # solid dark red border
+    "warning": (180, 83,  9,   255),   # solid dark amber border
+    "info":    (29,  78,  216, 255),   # solid dark blue border
 }
 
 # How much to expand a tight bbox so the highlight is clearly visible
@@ -337,26 +337,36 @@ def audit_pdf(pdf_path: str, max_pages: int = 20) -> dict:
             mat      = fitz.Matrix(1.5, 1.5)   # 108 DPI
             clip     = pg.rect
             pix      = pg.get_pixmap(matrix=mat, colorspace=fitz.csRGB, clip=clip)
-            img      = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            draw     = ImageDraw.Draw(img, "RGBA")
+            base_img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
             # Scale factor between PDF points and rendered pixels
             sx = pix.width  / (clip.x1 - clip.x0)
             sy = pix.height / (clip.y1 - clip.y0)
 
-            for fid in page_findings.get(page_num, []):
-                fnd = next((f for f in findings if f["id"] == fid), None)
-                if not fnd or not fnd.get("bbox"):
-                    continue
-                x0, y0, x1, y1 = fnd["bbox"]
-                px0 = max(0, (x0 - clip.x0) * sx - _PAD)
-                py0 = max(0, (y0 - clip.y0) * sy - _PAD)
-                px1 = min(pix.width,  (x1 - clip.x0) * sx + _PAD)
-                py1 = min(pix.height, (y1 - clip.y0) * sy + _PAD)
-                sev  = fnd["severity"]
-                fill = _COLORS.get(sev, _COLORS["info"])
-                outl = _OUTLINE.get(sev, _OUTLINE["info"])
-                draw.rectangle([px0, py0, px1, py1], fill=fill, outline=outl[:3] + (255,), width=2)
+            page_fids = page_findings.get(page_num, [])
+            if page_fids:
+                # Draw semi-transparent overlays onto a separate RGBA layer,
+                # then composite onto the RGB base — drawing RGBA directly on an
+                # RGB Image silently drops the alpha channel.
+                overlay = Image.new("RGBA", base_img.size, (0, 0, 0, 0))
+                draw    = ImageDraw.Draw(overlay)
+                for fid in page_fids:
+                    fnd = next((f for f in findings if f["id"] == fid), None)
+                    if not fnd or not fnd.get("bbox"):
+                        continue
+                    x0, y0, x1, y1 = fnd["bbox"]
+                    px0 = max(0, (x0 - clip.x0) * sx - _PAD)
+                    py0 = max(0, (y0 - clip.y0) * sy - _PAD)
+                    px1 = min(pix.width,  (x1 - clip.x0) * sx + _PAD)
+                    py1 = min(pix.height, (y1 - clip.y0) * sy + _PAD)
+                    sev  = fnd["severity"]
+                    fill = _COLORS.get(sev, _COLORS["info"])
+                    outl = _OUTLINE.get(sev, _OUTLINE["info"])
+                    draw.rectangle([px0, py0, px1, py1], fill=fill)
+                    draw.rectangle([px0, py0, px1, py1], outline=outl, width=3)
+                img = Image.alpha_composite(base_img.convert("RGBA"), overlay).convert("RGB")
+            else:
+                img = base_img
 
             buf = io.BytesIO()
             img.save(buf, format="JPEG", quality=72)
