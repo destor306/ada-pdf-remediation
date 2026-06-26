@@ -862,8 +862,21 @@ def analyze_page(
         print(f"    → Using Claude API fallback for page {page_num}")
         result = analyze_with_claude(pdf_path, page_num, text_hint, image_count)
 
-    if result is None:
-        result = analyze_with_mock(pdf_path, page_num, text_hint)
+    if result is None or not result.get("elements"):
+        # No usable AI output (None = backend unavailable; empty elements = hit
+        # max_tokens on every attempt and couldn't extract any structure).
+        # Fall back to the font-size-aware text analyzer so we still produce
+        # *some* struct elements rather than an empty StructTreeRoot, which
+        # is a hard accessibility failure (worse than imperfect tagging).
+        if result is None:
+            result = analyze_with_mock(pdf_path, page_num, text_hint)
+        else:
+            print(f"  [warn] AI returned empty elements for page {page_num} (likely max_tokens) — using text fallback")
+            fallback = analyze_text_page(pdf_path, page_num)
+            if fallback.get("elements"):
+                result = fallback
+            else:
+                result = analyze_with_mock(pdf_path, page_num, text_hint)
     else:
         # AI table extraction can lose rows on unusually dense tables (e.g. a
         # JSON-escaping failure mid-table). pdfplumber's deterministic
@@ -1250,6 +1263,7 @@ def _match_blocks_to_elements(blocks: list[dict], elements: list[dict]) -> dict[
     assignments = {}
     used_elements = set()
     mcid = 0
+    _critical_tags = {'TH'} | {f'H{i}' for i in range(1, 7)}
 
     for block_idx, block in enumerate(blocks):
         if block['type'] == 'image':
@@ -1266,10 +1280,11 @@ def _match_blocks_to_elements(blocks: list[dict], elements: list[dict]) -> dict[
             continue
 
         best_elem, best_score = None, 0
+        best_critical, best_critical_score = None, 0
+        bwords = set(block_text.split())
         for ei, elem in enumerate(elem_info):
             if ei in used_elements or not elem['text']:
                 continue
-            bwords = set(block_text.split())
             ewords = set(elem['text'].split())
             overlap = len(bwords & ewords)
             # Containment (overlap / smaller set), not Jaccard (overlap / larger
@@ -1278,29 +1293,33 @@ def _match_blocks_to_elements(blocks: list[dict], elements: list[dict]) -> dict[
             # several lines. Dividing by the larger set systematically
             # under-scores true matches when the two text lengths differ a lot.
             score = overlap / min(len(bwords), len(ewords))
-            if score > best_score and score > 0.5:
-                best_score = score
-                best_elem = ei
+            if score > 0.5:
+                is_critical = elem['tag'] in _critical_tags
+                if is_critical and score > best_critical_score:
+                    best_critical_score = score
+                    best_critical = ei
+                elif not is_critical and score > best_score:
+                    best_score = score
+                    best_elem = ei
 
-        if best_elem is not None:
-            chosen = elem_info[best_elem]
-            assignments[block_idx] = (chosen['tag'], mcid, chosen['group'], best_elem)
-            used_elements.add(best_elem)
+        # Structural tags (TH, headings) take priority over paragraph/caption
+        # when both match a block — otherwise a greedy paragraph match in pass 1
+        # can consume a block that a header row needs, leaving the table with
+        # zero TH cells even after the relaxed pass-2 retry (which only sees
+        # blocks that remain unmatched after pass 1).
+        chosen_ei = best_critical if best_critical is not None else best_elem
+        if chosen_ei is not None:
+            chosen = elem_info[chosen_ei]
+            assignments[block_idx] = (chosen['tag'], mcid, chosen['group'], chosen_ei)
+            used_elements.add(chosen_ei)
             mcid += 1
 
-    # Second pass: header-row (TH) and heading (H1-H6) candidates are
-    # structurally critical — a table with zero TH tags fails Section 508
-    # even if every data cell tagged correctly, and a heading that's dropped
-    # entirely (rather than mis-leveled) shows up as a level *skip* between
-    # whichever headings on either side of it did get tagged. Dense forms
+    # Second pass: TH and heading candidates that failed to match in pass 1
+    # even with priority get a relaxed 0.25 threshold retry. Dense forms
     # often split a cell or heading's text across many tiny content-stream
     # fragments (single words, sometimes single tokens), so a candidate can
-    # legitimately fail the stricter 0.5 containment bar against every
-    # fragment and end up completely untagged. Retry just the still-unmatched
-    # TH/heading candidates against still-unmatched blocks with a relaxed
-    # threshold — bounded to those tags and unused blocks/elements so it
-    # can't disturb assignments already resolved above.
-    _critical_tags = {'TH'} | {f'H{i}' for i in range(1, 7)}
+    # legitimately fail the stricter 0.5 bar against every fragment and end
+    # up completely untagged.
     unmatched_blocks = [
         bi for bi, b in enumerate(blocks)
         if bi not in assignments and b['type'] == 'text' and b.get('text', '').strip()
