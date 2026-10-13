@@ -199,14 +199,33 @@ def get_page_dimensions(pdf_path: str) -> list[tuple[float, float]]:
 MIN_IMAGE_WIDTH  = 50   # pixels — skip tiny icons/bullets
 MIN_IMAGE_HEIGHT = 50
 
+def _page_has_form_fields(pdf_path: str, page_num: int) -> bool:
+    """True if the page has AcroForm widget annotations (fillable fields).
+
+    Pages with form fields must go through vision analysis even when they
+    have no tables/images — the text-only path can't see or emit fields,
+    so they'd be silently dropped from the DOCX.
+    """
+    try:
+        import fitz
+        doc = fitz.open(pdf_path)
+        widgets = list(doc[page_num - 1].widgets() or [])
+        doc.close()
+        return len(widgets) > 0
+    except Exception:
+        return False
+
+
 def classify_page_complexity(pdf_path: str, page_num: int) -> str:
-    """Return 'simple' (text only) or 'complex' (has tables or images)."""
+    """Return 'simple' (text only) or 'complex' (has tables, images, or form fields)."""
     with pdfplumber.open(pdf_path) as pdf:
         page = pdf.pages[page_num - 1]
         if page.extract_tables():
             return "complex"
         if page.images:
             return "complex"
+    if _page_has_form_fields(pdf_path, page_num):
+        return "complex"
     return "simple"
 
 
@@ -235,9 +254,10 @@ def extract_page_images(pdf_path: str, page_num: int) -> list[dict]:
             if w < MIN_IMAGE_WIDTH or h < MIN_IMAGE_HEIGHT:
                 continue
 
-            # Get bounding box on the page (for vertical ordering)
+            # Get bounding box on the page (for ordering and caption binding)
             rects = page.get_image_rects(xref)
             bbox_y = rects[0].y0 if rects else 0
+            bbox_x = rects[0].x0 if rects else 0
 
             results.append({
                 "bytes": base["image"],
@@ -245,6 +265,7 @@ def extract_page_images(pdf_path: str, page_num: int) -> list[dict]:
                 "width": w,
                 "height": h,
                 "bbox_y": bbox_y,
+                "bbox_x": bbox_x,
                 "xref": xref,
             })
         except Exception:
@@ -286,11 +307,15 @@ JSON schema:
   "page": <int>,
   "elements": [
     {
-      "type": "heading" | "paragraph" | "table" | "list" | "caption" | "image" | "header" | "footer",
+      "type": "heading" | "paragraph" | "table" | "list" | "caption" | "image" | "header" | "footer" | "form_field",
       "level": <int 1-6>,               // headings only
       "text": "<string>",               // all text types
       "alt_text": "<string>",           // image only — 120-250 characters, describes what the image conveys
       "caption": "<string>",            // image only — visible caption text near the image (or "")
+      "field_kind": "text" | "textarea" | "checkbox" | "radio" | "dropdown",  // form_field only
+      "label": "<string>",              // form_field only — visible label text of the field
+      "options": ["<string>", ...],     // form_field only — dropdown/radio: visible option labels
+      "checked": <bool>,                // form_field only — checkbox/radio: appears marked
       "rows": [                         // table only
         { "is_header": <bool>, "col_scope": "col" | "row" | null, "cells": ["<string>", ...] }
       ],
@@ -329,6 +354,22 @@ LISTS:
 - Bullets and numbers are informational — include them in the items array (strip the bullet character, keep the text).
 - Set ordered: true for numbered lists, false for bulleted lists.
 
+FORM FIELDS:
+- Every visible form field (text box, text area, checkbox, radio button, dropdown/select)
+  gets its own element of type "form_field", placed in reading order where it appears.
+- "label": the visible label text associated with the field (e.g. "Full Legal Name").
+  If a field has no visible label, use the nearest descriptive text, or "".
+- "field_kind": text | textarea | checkbox | radio | dropdown.
+- checkbox/radio: set "checked" true/false based on whether it appears marked.
+- dropdown: list the visible options in "options".
+- Do NOT merge a field into its label's paragraph — a field is always its own element,
+  even when it sits on the same visual line as its label.
+
+TEXT FIDELITY:
+- Transcribe text exactly as it appears, preserving spaces between distinct words and labels.
+  Never concatenate adjacent labels: "First Name" and "Last Name" stay separate with a space,
+  never "First NameLast Name". When in doubt, keep the space.
+
 IMAGES / FIGURES:
 - Use type "image" for all visual images that convey information: charts, photos, logos, signatures, diagrams.
 - alt_text must describe what the image CONVEYS to a sighted user (not just what it looks like).
@@ -336,6 +377,13 @@ IMAGES / FIGURES:
   Bad: "A bar chart" or "Chart"
 - Keep alt_text between 120–250 characters for complex images. Simpler images (logos, signatures) can be shorter.
 - Purely decorative images that convey no information: use alt_text: "" (empty string).
+- Every distinct signature is its own image element with alt_text like
+  "Signature of Dr. J. Williams". Never omit a signature and never merge two
+  signatures into one element.
+- CAPTION BINDING: a caption belongs to the figure it sits nearest to or explicitly names
+  ("Figure 1 (left)", "Figure 2 (right)"). Set it on that image's "caption" field only.
+  Verify left/right/above/below positional hints against where each figure actually sits
+  on the page before assigning — a swapped caption is worse than none.
 
 HEADER / FOOTER:
 - Page footer (text in the bottom margin, below main content): use type "footer".
@@ -519,12 +567,17 @@ PAGE_ELEMENTS_TOOL = {
                         "type": {
                             "type": "string",
                             "enum": ["heading", "paragraph", "table", "list", "caption",
-                                     "image", "header", "footer"],
+                                     "image", "header", "footer", "form_field"],
                         },
                         "level": {"type": "integer", "minimum": 1, "maximum": 6},
                         "text": {"type": "string"},
                         "alt_text": {"type": "string"},
                         "caption": {"type": "string"},
+                        "field_kind": {"type": "string",
+                                       "enum": ["text", "textarea", "checkbox", "radio", "dropdown"]},
+                        "label": {"type": "string"},
+                        "options": {"type": "array", "items": {"type": "string"}},
+                        "checked": {"type": "boolean"},
                         "rows": {
                             "type": "array",
                             "items": {
@@ -822,6 +875,36 @@ def _attach_images_to_elements(elements: list[dict], page_images: list[dict]) ->
                 elem["_image_ext"]   = img["ext"]
                 elem["_image_width"] = img["width"]
                 elem["_image_height"] = img["height"]
+                elem["_image_x"] = img.get("bbox_x", 0)
+    return elements
+
+
+def _fix_caption_binding(elements: list[dict]) -> list[dict]:
+    """Deterministically rebind captions that carry explicit positional hints.
+
+    The vision model sometimes swaps captions between side-by-side figures
+    (e.g. the pie chart gets "Figure 1 (left)" and the bar chart gets
+    "Figure 2 (right)"). A caption naming (left) belongs to the leftmost
+    image on the page and (right) to the rightmost — trust the hint over the
+    model's assignment. Idempotent when already correct.
+    """
+    hinted = []
+    for e in elements:
+        if e.get("type") != "image":
+            continue
+        m = re.search(r"\((left|right)\)", e.get("caption") or "", re.IGNORECASE)
+        if m:
+            hinted.append((e, m.group(1).lower()))
+    if len(hinted) < 2:
+        return elements
+    by_hint = {}
+    for e, h in hinted:
+        by_hint.setdefault(h, e.get("caption"))
+    if set(by_hint) != {"left", "right"}:
+        return elements
+    ordered = sorted([e for e, _ in hinted], key=lambda e: e.get("_image_x", 0))
+    ordered[0]["caption"] = by_hint["left"]
+    ordered[-1]["caption"] = by_hint["right"]
     return elements
 
 
@@ -883,12 +966,44 @@ def analyze_page(
         # extraction doesn't suffer that failure mode — use it to backstop
         # completeness when the AI's row count looks suspiciously low.
         result["elements"] = _backstop_table_rows(pdf_path, page_num, result.get("elements", []))
+        # Vision sometimes flags totals/summary rows as headers — demote them
+        # to data rows (deterministic; no model variance, no token cost).
+        result["elements"] = _demote_summary_rows(result.get("elements", []))
 
     # Attach real image bytes to image elements
     if page_images:
         result["elements"] = _attach_images_to_elements(result.get("elements", []), page_images)
+        result["elements"] = _fix_caption_binding(result.get("elements", []))
 
     return result
+
+
+_SUMMARY_ROW_RE = re.compile(r"^(total|subtotal|grand\s+total|sums?|averages?|avg)\b", re.IGNORECASE)
+
+
+def _demote_summary_rows(elements: list[dict]) -> list[dict]:
+    """Demote vision-flagged header rows that are actually summary rows.
+
+    The vision model sometimes marks totals/summary rows (e.g. a bottom
+    "TOTAL | 3,810 | 3,092 | ..." row) is_header=True. A summary row is
+    data, not a header — tagging it TH makes screen readers announce
+    summary values as column headers. Detect by the first cell matching
+    total-like labels and force is_header=False (demote only, never
+    promote: a genuine header row is untouched).
+    """
+    for elem in elements:
+        if elem.get("type") != "table":
+            continue
+        for row in elem.get("rows", []):
+            if not row.get("is_header"):
+                continue
+            cells = row.get("cells", [])
+            if len(cells) < 2:
+                continue
+            first = str(cells[0] or "").strip()
+            if _SUMMARY_ROW_RE.match(first):
+                row["is_header"] = False
+    return elements
 
 
 def _backstop_table_rows(pdf_path: str, page_num: int, elements: list[dict]) -> list[dict]:
@@ -959,6 +1074,17 @@ def set_cell_shading(cell, fill: str = "D9E1F2"):
     tcPr.append(shd)
 
 
+def _clean_inline_text(text) -> str:
+    """Collapse all whitespace runs (newlines, tabs, multiples) to single spaces.
+
+    python-docx writes a raw '\\n' into w:t verbatim, where renderers drop it
+    silently — gluing words together ("CoordinatorDate: June 12, 2025").
+    Vision output routinely contains \\n inside a single logical paragraph,
+    so normalize at DOCX build time.
+    """
+    return re.sub(r"\s+", " ", str(text or "")).strip()
+
+
 def add_accessible_table(doc: Document, rows_data: list[dict], col_widths: list[float] | None, page_width_in: float):
     if not rows_data:
         return
@@ -992,7 +1118,7 @@ def add_accessible_table(doc: Document, rows_data: list[dict], col_widths: list[
         for i, text in enumerate(cells_text):
             cell = row.cells[i]
             para = cell.paragraphs[0]
-            run = para.add_run(str(text))
+            run = para.add_run(_clean_inline_text(text))
             if is_header:
                 run.bold = True
                 set_cell_shading(cell)
@@ -1043,11 +1169,11 @@ def build_docx(pages_data: list[dict], output_path: str, page_dims: list[tuple[f
         if header_elems:
             current_section.header.is_linked_to_previous = False
             hdr_para = current_section.header.paragraphs[0]
-            hdr_para.text = " ".join(e.get("text", "") for e in header_elems)
+            hdr_para.text = " ".join(_clean_inline_text(e.get("text", "")) for e in header_elems)
         if footer_elems:
             current_section.footer.is_linked_to_previous = False
             ftr_para = current_section.footer.paragraphs[0]
-            ftr_para.text = " ".join(e.get("text", "") for e in footer_elems)
+            ftr_para.text = " ".join(_clean_inline_text(e.get("text", "")) for e in footer_elems)
 
         if not body_elems:
             # Preserve page count: still emit a page break for blank/unextracted pages
@@ -1063,7 +1189,7 @@ def build_docx(pages_data: list[dict], output_path: str, page_dims: list[tuple[f
 
         for elem in body_elems:
             etype = elem.get("type", "paragraph")
-            text = elem.get("text", "").strip()
+            text = _clean_inline_text(elem.get("text", ""))
 
             if etype == "heading":
                 level = max(1, min(6, elem.get("level", 2)))
@@ -1081,11 +1207,32 @@ def build_docx(pages_data: list[dict], output_path: str, page_dims: list[tuple[f
             elif etype == "list":
                 style_name = "List Number" if elem.get("ordered") else "List Bullet"
                 for item in elem.get("items", []):
-                    doc.add_paragraph(item, style=style_name)
+                    doc.add_paragraph(_clean_inline_text(item), style=style_name)
 
             elif etype == "caption":
                 if text:
                     doc.add_paragraph(text, style="Caption")
+
+            elif etype == "form_field":
+                # Render an editable-looking placeholder so fields are never silently dropped
+                kind = elem.get("field_kind", "text")
+                label = _clean_inline_text(elem.get("label") or text)
+                if kind == "checkbox":
+                    box = "☒" if elem.get("checked") else "☐"
+                    doc.add_paragraph(f"{box} {label}".strip())
+                elif kind == "radio":
+                    dot = "◉" if elem.get("checked") else "○"
+                    doc.add_paragraph(f"{dot} {label}".strip())
+                elif kind == "dropdown":
+                    opts = elem.get("options") or []
+                    shown = f" ({', '.join(opts[:6])})" if opts else ""
+                    doc.add_paragraph(f"{label}: [ select ▾ ]{shown}".strip() if label else f"[ select ▾ ]{shown}")
+                elif kind == "textarea":
+                    if label:
+                        doc.add_paragraph(f"{label}:")
+                    doc.add_paragraph("_" * 60)
+                else:  # text
+                    doc.add_paragraph(f"{label}: ________".strip() if label else "________")
 
             elif etype in ("image", "image_alt"):
                 img_bytes = elem.get("_image_bytes")
@@ -1096,10 +1243,12 @@ def build_docx(pages_data: list[dict], output_path: str, page_dims: list[tuple[f
                     # Embed the real extracted image
                     img_width  = elem.get("_image_width", 1)
                     img_height = elem.get("_image_height", 1)
-                    # Fit within usable page width (page_w minus margins)
+                    # Fit within usable page width (page_w minus margins).
+                    # Default to 70% width: full-width charts blow out pagination
+                    # (was min(max_w, max_w) — a no-op that always used full width).
                     max_w = page_w - 1.5
                     aspect = img_height / img_width if img_width else 1
-                    fit_w = min(max_w, max_w)   # full width by default
+                    fit_w = max_w * 0.7
                     fit_h = fit_w * aspect
                     # If taller than half a page, shrink to fit
                     max_h = (page_dims[idx][1] if page_dims and idx < len(page_dims) else 11.0) * 0.5
@@ -1129,6 +1278,11 @@ def build_docx(pages_data: list[dict], output_path: str, page_dims: list[tuple[f
 
                 if caption_text:
                     doc.add_paragraph(caption_text, style="Caption")
+
+            else:
+                # Never silently drop an element the model emitted — render its text
+                if text:
+                    doc.add_paragraph(text)
 
         if idx < len(pages_data) - 1:
             # Add page break and new section if page size changes
@@ -1219,6 +1373,11 @@ def _match_blocks_to_elements(blocks: list[dict], elements: list[dict]) -> dict[
     stream in field-definition order rather than top-to-bottom order — so the
     caller must build the struct tree (and therefore heading order) from
     `elem_order`, not from `block_idx`.
+
+    A third pass rescues unmatched TABLE cells positionally (see inline
+    comments): vision-detected cells with no text counterpart in the stream
+    (e.g. symbol-font glyphs) are placed by stream position instead of
+    being silently dropped.
     """
     TYPE_MAP = {'paragraph': 'P', 'caption': 'Caption', 'image_alt': 'Figure'}
 
@@ -1237,14 +1396,14 @@ def _match_blocks_to_elements(blocks: list[dict], elements: list[dict]) -> dict[
             gid = group_seq; group_seq += 1
             for r_idx, row in enumerate(rows):
                 is_header = row.get('is_header', r_idx == 0)
-                for cell_text in row.get('cells', []):
+                for c_idx, cell_text in enumerate(row.get('cells', [])):
                     cell_text = str(cell_text).strip()
                     if not cell_text:
                         continue
                     elem_info.append({
                         'tag': 'TH' if is_header else 'TD',
                         'text': cell_text.lower(),
-                        'group': {'type': 'Table', 'id': gid, 'row': r_idx},
+                        'group': {'type': 'Table', 'id': gid, 'row': r_idx, 'cell': c_idx},
                     })
         elif etype == 'list':
             items = elem.get('items', [])
@@ -1257,6 +1416,11 @@ def _match_blocks_to_elements(blocks: list[dict], elements: list[dict]) -> dict[
                     continue
                 elem_info.append({'tag': 'LI', 'text': item_text.lower(), 'group': {'type': 'L', 'id': gid}})
         else:
+            if etype == 'form_field':
+                # Form widgets are tagged separately via the annotation path;
+                # they have no content-stream text block to match — skip so we
+                # don't emit an empty P element for them.
+                continue
             text = elem.get('text', '').strip()
             elem_info.append({'tag': TYPE_MAP.get(etype, 'P'), 'text': text.lower(), 'group': None})
 
@@ -1345,6 +1509,68 @@ def _match_blocks_to_elements(blocks: list[dict], elements: list[dict]) -> dict[
             used_elements.add(ei)
             unmatched_blocks.remove(best_block)
             mcid += 1
+
+    # Third pass: positional fallback for unmatched TABLE cells.
+    #
+    # Vision-detected cells whose text has no counterpart in the content
+    # stream (e.g. symbol-font glyphs like ✓/✗ that extract as unrelated
+    # characters such as '3'/'7') would otherwise be silently dropped,
+    # leaving the struct tree with e.g. a "Compliant" TH header but none
+    # of its values — invisible to every checker, since the visual PDF
+    # still shows the glyphs. For each unmatched cell, look for a
+    # still-unmatched text block in the narrow stream interval around its
+    # expected row-major position (bounded by the nearest text-matched
+    # cells of the same table) and assign them in order.
+    #
+    # Safety guards (this is a heuristic rescue, not primary matching):
+    #  - the table needs at least one text-matched cell as a positional
+    #    anchor; wholly-unmatched tables are left alone;
+    #  - candidate blocks must be short (<= 4 chars): symbol-glyph
+    #    extractions are 1-2 characters, while longer unmatched text is
+    #    real content that failed matching for other reasons and must not
+    #    be swept into a table.
+    unmatched_cells = []  # (gid, row, cell_pos, ei, tag)
+    for ei, elem in enumerate(elem_info):
+        if ei in used_elements:
+            continue
+        g = elem.get('group')
+        if g and g['type'] == 'Table' and elem['tag'] in ('TD', 'TH'):
+            unmatched_cells.append((g['id'], g['row'], g['cell'], ei, elem['tag']))
+    if unmatched_cells:
+        anchor = {}  # (gid, row, cell_pos) -> block_idx, from text-matched cells
+        for bi, (_tag, _mcid, group, _ei) in assignments.items():
+            if group and group['type'] == 'Table':
+                anchor[(group['id'], group['row'], group['cell'])] = bi
+        remaining = [bi for bi, b in enumerate(blocks)
+                     if bi not in assignments
+                     and b['type'] == 'text'
+                     and 0 < len(b.get('text', '').strip()) <= 4]
+        by_table: dict = {}
+        for gid, row, pos, ei, tag in unmatched_cells:
+            by_table.setdefault(gid, []).append((row, pos, ei, tag))
+        for gid, cells in by_table.items():
+            table_anchors = sorted(
+                (r, p, bi) for (g, r, p), bi in anchor.items() if g == gid
+            )
+            if not table_anchors:
+                continue
+            buckets: dict = {}
+            for (row, pos, ei, tag) in cells:
+                lo, hi = -1, float('inf')
+                for (ar, ap, abi) in table_anchors:
+                    if (ar, ap) < (row, pos) and abi > lo:
+                        lo = abi
+                    if (ar, ap) > (row, pos) and abi < hi:
+                        hi = abi
+                buckets.setdefault((lo, hi), []).append((row, pos, ei, tag))
+            for (lo, hi), bucket in buckets.items():
+                cands = sorted(bi for bi in remaining if lo < bi < hi)
+                bucket.sort()
+                for (_row, _pos, ei, tag), bi in zip(bucket, cands):
+                    assignments[bi] = (tag, mcid, elem_info[ei]['group'], ei)
+                    used_elements.add(ei)
+                    remaining.remove(bi)
+                    mcid += 1
 
     return assignments
 
@@ -1510,6 +1736,77 @@ def _looks_like_field_label(text: str) -> bool:
     return False
 
 
+def _synthesize_widget_tu(source_pdf: str, page_idx: int, rect) -> str:
+    """Best-effort accessible name (/TU tooltip) for a form widget, derived
+    from nearby visible text.
+
+    Finds the closest word to the widget rect (Manhattan edge distance, so
+    long labels and multi-column layouts don't confuse it), then expands to
+    adjacent words on the same visual line to form the full label phrase.
+
+    A bare field number ("24.", "5.a.") — detected by _looks_like_field_label —
+    is deprioritized as a label when descriptive text is equally close, since
+    the number alone is a poor accessible name; it is still used when nothing
+    better exists. Returns "" when no usable text is found.
+    """
+    try:
+        with pdfplumber.open(source_pdf) as pdf:
+            if page_idx >= len(pdf.pages):
+                return ""
+            page = pdf.pages[page_idx]
+            words = page.extract_words(x_tolerance=2, y_tolerance=2)
+            page_h = float(page.height)
+    except Exception:
+        return ""
+    if not words:
+        return ""
+    wx0, wy0, wx1, wy1 = (float(v) for v in rect)
+
+    def _edge_dist(w):
+        dx = 0.0 if w["x0"] <= wx1 and w["x1"] >= wx0 else min(abs(w["x0"] - wx1), abs(w["x1"] - wx0))
+        wyc = page_h - (w["top"] + w["bottom"]) / 2
+        dy = 0.0 if wy0 <= wyc <= wy1 else min(abs(wyc - wy0), abs(wyc - wy1))
+        return dx + dy, wyc
+
+    scored = []
+    for w in words:
+        if not w["text"].strip():
+            continue
+        dist, wyc = _edge_dist(w)
+        if dist > 120:  # too far to plausibly be this widget's label
+            continue
+        # Deprioritize bare field numbers when descriptive text is nearby
+        penalty = 5.0 if _looks_like_field_label(w["text"]) else 0.0
+        scored.append((dist + penalty, w))
+    if not scored:
+        return ""
+    scored.sort(key=lambda t: t[0])
+    seed = scored[0][1]
+
+    # Expand to adjacent words on the same visual line (same baseline band,
+    # small horizontal gaps) to reconstruct the full label phrase.
+    band = (seed["top"] + seed["bottom"]) / 2
+    line_words = [
+        w for w in words
+        if abs((w["top"] + w["bottom"]) / 2 - band) <= 4 and w["text"].strip()
+    ]
+    line_words.sort(key=lambda w: w["x0"])
+    seed_i = next(i for i, w in enumerate(line_words) if w is seed)
+    lo = hi = seed_i
+    while lo > 0 and line_words[lo]["x0"] - line_words[lo - 1]["x1"] <= 14:
+        lo -= 1
+    while hi < len(line_words) - 1 and line_words[hi + 1]["x0"] - line_words[hi]["x1"] <= 14:
+        hi += 1
+    label = " ".join(w["text"] for w in line_words[lo:hi + 1]).strip()
+    return label[:200]
+
+
+_SECTION_LIKE_RE = re.compile(
+    r"^(section|appendix|annex|exhibit|schedule|attachment|part|chapter)\b",
+    re.IGNORECASE,
+)
+
+
 def _normalize_heading_levels(pages_data: list[dict]) -> None:
     """Normalize heading levels across the whole document so there are no
     gaps (e.g. a document-wide H1 -> H3 becomes H1 -> H2), mutating elements
@@ -1543,6 +1840,27 @@ def _normalize_heading_levels(pages_data: list[dict]) -> None:
             elem["level"] = level
             prev_level = level
 
+    # Cross-page outline repair: each page is judged in isolation, so a
+    # section header on a later page can come back H1 ("APPENDIX — ...")
+    # even though the document already established H2 as its section
+    # level ("SECTION B", "SECTION C", ...). A second H1 that reads like
+    # a section header is demoted to the established section level.
+    # Guarded two ways: it only fires when H2 exists in the document
+    # (so we know the section level), and only for section-like titles —
+    # a genuine second top-level part is left alone.
+    headings = [e for p in pages_data for e in p.get("elements", [])
+                if e.get("type") == "heading"]
+    if any(e.get("level") == 2 for e in headings):
+        seen_first_h1 = False
+        for elem in headings:
+            if elem.get("level") != 1:
+                continue
+            if not seen_first_h1:
+                seen_first_h1 = True
+                continue
+            if _SECTION_LIKE_RE.match(elem.get("text", "").strip()):
+                elem["level"] = 2
+
 
 def tag_pdf_with_accessibility(
     source_pdf: str,
@@ -1569,7 +1887,8 @@ def tag_pdf_with_accessibility(
         with pdf.open_metadata(set_pikepdf_as_editor=False) as meta:
             if not meta.get('dc:title'):
                 meta['dc:title'] = doc_title
-            meta['dc:language'] = 'en-US'
+            # dc:language is an rdf:Bag in XMP — assign a list, not a string
+            meta['dc:language'] = ['en-US']
             # Required to declare PDF/UA-1 conformance (Matterhorn 06-001)
             meta['pdfuaid:part'] = '1'
         pdf.Root['/Lang'] = String('en-US')
@@ -1590,6 +1909,7 @@ def tag_pdf_with_accessibility(
 
         all_struct_elems = []   # flattened list for the Document StructElem
         page_parent_arrays = [] # one Array per tagged page for the ParentTree
+        annot_form_pairs = []   # (widget annot, Form StructElem) for ParentTree keys
 
         for page_idx, page_data in enumerate(pages_data):
             if page_idx >= len(pdf.pages):
@@ -1619,6 +1939,93 @@ def tag_pdf_with_accessibility(
             except Exception as e:
                 print(f"  [warn] MCID injection failed p{page_idx + 1}: {e}")
                 continue
+
+            # ── Widget annotation (form field) tagging ───────────────────
+            # Widget annotations live in /Annots, not the content stream, so
+            # they never receive MCIDs. PDF/UA requires each widget to be
+            # referenced from the structure tree via a Form element, with
+            # /StructParent on the annotation and an accessible name in /TU.
+            # (Our own checker, PAC, and Acrobat all flag missing ones.)
+            # Runs even when the page has no content assignments — a page of
+            # bare form fields still needs its widgets tagged.
+            annots_arr = page_obj.get("/Annots")
+            if annots_arr:
+                # Snapshot pre-existing /TU values (keyed by objgen) BEFORE
+                # this loop writes any. Without this, propagating /TU to a
+                # shared parent field would leak the first sibling's tooltip
+                # into every other sibling (e.g. all radio buttons in a group
+                # inheriting "Email").
+                parent_tu_before: dict = {}
+                for _a in annots_arr:
+                    try:
+                        if str(_a.get("/Subtype", "")) != "/Widget":
+                            continue
+                        _p = _a.get("/Parent")
+                        if _p is not None:
+                            _og = _p.objgen
+                            if _og not in parent_tu_before:
+                                _pv = str(_p.get("/TU") or "").strip()
+                                if _pv:
+                                    parent_tu_before[_og] = _pv
+                    except Exception:
+                        continue
+                for a_idx in range(len(annots_arr)):
+                    annot = annots_arr[a_idx]
+                    try:
+                        if str(annot.get("/Subtype", "")) != "/Widget":
+                            continue
+                    except Exception:
+                        continue
+                    # OBJR requires an indirect object — promote direct annots.
+                    if not annot.is_indirect:
+                        annot = pdf.make_indirect(annot)
+                        annots_arr[a_idx] = annot
+                    # Accessible name priority: existing /TU wins; then the
+                    # visible label text near the widget (WCAG 2.5.3 "Label in
+                    # Name" — the accessible name should contain the visible
+                    # label, which beats internal /T identifiers like
+                    # "full_name"); then the field's /T partial name; then a
+                    # generic fallback so no widget is ever left unnamed.
+                    tu = str(annot.get("/TU") or "").strip()
+                    parent = None
+                    field_name = ""
+                    try:
+                        parent = annot.get("/Parent")
+                        if parent is not None:
+                            if not tu:
+                                tu = parent_tu_before.get(parent.objgen, "")
+                            field_name = str(parent.get("/T") or "").strip()
+                    except Exception:
+                        parent = None
+                    if not field_name:
+                        field_name = str(annot.get("/T") or "").strip()
+                    if not tu:
+                        tu = (_synthesize_widget_tu(
+                            source_pdf, page_idx, annot.get("/Rect"))
+                            or field_name)
+                    if not tu:
+                        tu = f"Form field {a_idx + 1}"
+                    if not annot.get("/TU"):
+                        annot["/TU"] = String(tu)
+                        if parent is not None:
+                            try:
+                                if not parent.get("/TU"):
+                                    parent["/TU"] = String(tu)
+                            except Exception:
+                                pass
+                    form_ref = pdf.make_indirect(Dictionary(
+                        Type=Name("/StructElem"),
+                        S=Name("/Form"),
+                        Pg=page_obj.obj,
+                        T=String(tu[:200]),
+                        K=Array([Dictionary(
+                            Type=Name("/OBJR"),
+                            Obj=annot,
+                            Pg=page_obj.obj,
+                        )]),
+                    ))
+                    all_struct_elems.append(form_ref)
+                    annot_form_pairs.append((annot, form_ref))
 
             if not assignments:
                 continue  # No struct elements needed for this page
@@ -1780,17 +2187,25 @@ def tag_pdf_with_accessibility(
             ref['/P'] = doc_elem
 
         # ParentTree Nums: [0, array_for_page0, 1, array_for_page1, ...]
-        # Each array maps MCID index → parent StructElem for that page
+        # Each array maps MCID index → parent StructElem for that page.
+        # Widget annotations get their own keys after the page keys: an
+        # annotation's /StructParent is a direct key into this number tree.
         nums: list = []
         for idx, arr in enumerate(page_parent_arrays):
             nums.extend([PikInt(idx), pdf.make_indirect(arr)])
+
+        base_key = len(page_parent_arrays)
+        for i, (annot, form_ref) in enumerate(annot_form_pairs):
+            key = base_key + i
+            nums.extend([PikInt(key), pdf.make_indirect(Array([form_ref]))])
+            annot['/StructParent'] = PikInt(key)
 
         parent_tree = pdf.make_indirect(Dictionary(Nums=Array(nums)))
         struct_root = pdf.make_indirect(Dictionary(
             Type=Name('/StructTreeRoot'),
             K=Array([doc_elem]),
             ParentTree=parent_tree,
-            ParentTreeNextKey=PikInt(len(page_parent_arrays)),
+            ParentTreeNextKey=PikInt(base_key + len(annot_form_pairs)),
         ))
         doc_elem['/P'] = struct_root
         pdf.Root['/StructTreeRoot'] = struct_root
@@ -2106,8 +2521,383 @@ def _fix_multicolumn_sections(doc: Document) -> None:
                 sec_type.set(qn('w:val'), 'continuous')
 
 
-def convert_to_docx(
-    pdf_path: str,
+# ---------------------------------------------------------------------------
+# Visual-DOCX repair (pdf2docx failure modes)
+# ---------------------------------------------------------------------------
+
+def _repair_visual_docx(docx_path: str, pdf_path: str, pages_data: list[dict]) -> None:
+    """Fix pdf2docx's known failure modes using ground truth from the PDF and
+    the vision analysis:
+
+    1. Checkbox glyphs: pdf2docx drops AcroForm checkbox widgets entirely and
+       mashes their labels together ("A B C" -> "ABC"). Rebuild each checkbox
+       row as proper ☐/☒ glyph + label runs from the vision field data.
+    2. Side-by-side images: pdf2docx's layout analysis stacks horizontally
+       arranged images vertically. Detect side-by-side image groups from the
+       source PDF geometry and restore them into a borderless 2-column table,
+       matching DOCX images to source rects by aspect ratio.
+    """
+    from docx import Document
+    from docx.shared import Pt, Inches
+    from docx.oxml.ns import qn
+
+    doc = Document(docx_path)
+
+    # --- 1. Checkbox row repair -------------------------------------------
+    # Vision bboxes for form fields are often None; fall back to AcroForm
+    # geometry (matched by document order) for row grouping.
+    acro_cb_ys = _acro_widget_ys(pdf_path, (2,))
+    acro_radio_ys = _acro_widget_ys(pdf_path, (5,))
+    for page_idx, page in enumerate(pages_data):
+        cbs = [e for e in page.get("elements", [])
+               if e.get("type") == "form_field"
+               and e.get("field_kind") == "checkbox"
+               and e.get("label")]
+        if len(cbs) < 2:
+            continue
+        if all(e.get("bbox") for e in cbs):
+            ys = [(e["bbox"][1] + e["bbox"][3]) / 2 for e in cbs]
+        else:
+            ys = (acro_cb_ys.get(page_idx) or [0] * len(cbs))[:len(cbs)]
+            if len(ys) < len(cbs):
+                ys = ys + [0] * (len(cbs) - len(ys))
+        groups: list[list[int]] = []
+        for i in sorted(range(len(cbs)), key=lambda i: ys[i]):
+            placed = False
+            for g in groups:
+                if abs(ys[i] - ys[g[0]]) < 25:
+                    g.append(i)
+                    placed = True
+                    break
+            if not placed:
+                groups.append([i])
+        for g in groups:
+            if len(g) >= 2:
+                items = [(cbs[i]["label"].strip(), bool(cbs[i].get("checked")))
+                         for i in g]
+                _repair_checkbox_group(doc, items)
+
+    # --- 1b. Radio button repair -------------------------------------------
+    # pdf2docx renders radio widgets as doubled/artifact circles; replace with
+    # clean ○/◉ glyphs like checkboxes.
+    for page_idx, page in enumerate(pages_data):
+        radios = [e for e in page.get("elements", [])
+                  if e.get("type") == "form_field"
+                  and e.get("field_kind") == "radio"
+                  and e.get("label")]
+        if len(radios) < 2:
+            continue
+        # group by row using AcroForm y (vision bboxes are None)
+        ys = (acro_radio_ys.get(page_idx) or [0] * len(radios))[:len(radios)]
+        if len(ys) < len(radios):
+            ys = ys + [0] * (len(radios) - len(ys))
+        groups: list[list[int]] = []
+        for i in sorted(range(len(radios)), key=lambda i: ys[i]):
+            placed = False
+            for g in groups:
+                if abs(ys[i] - ys[g[0]]) < 25:
+                    g.append(i)
+                    placed = True
+                    break
+            if not placed:
+                groups.append([i])
+        for g in groups:
+            if len(g) >= 2:
+                items = [(radios[i]["label"].strip(), bool(radios[i].get("checked")))
+                         for i in g]
+                _repair_radio_group(doc, items)
+
+    # --- 2. Side-by-side image repair --------------------------------------
+    _repair_side_by_side_images(doc, pdf_path)
+
+    # --- 3. Spacing normalization ------------------------------------------
+    # pdf2docx converts visual gaps into excessive paragraph before/after
+    # spacing (up to 30pt). Cap it to match the source's compact density.
+    _normalize_spacing(doc)
+
+    doc.save(docx_path)
+
+
+def _normalize_spacing(doc) -> None:
+    """Cap pdf2docx's excessive paragraph before/after spacing.
+
+    pdf2docx converts the PDF's visual gaps into w:spacing before/after values
+    up to 30pt, producing the 'huge gap between lines' effect. The source
+    forms are compact; cap spacing to preserve density without collapsing
+    readability. Applies to body paragraphs and table cells.
+
+    Also normalizes outlier label indents: pdf2docx sometimes assigns a
+    near-zero left indent to a few field labels (e.g. 'Last Name',
+    'Case / File Number') while the rest use the standard indent, making
+    them look shifted. Snap outliers to the dominant indent.
+    """
+    from docx.oxml.ns import qn
+    MAX_SPACING = 120  # twips = 6pt
+
+    def _fix_paragraph(p):
+        pPr = p._p.find(qn("w:pPr"))
+        if pPr is None:
+            return
+        spacing = pPr.find(qn("w:spacing"))
+        if spacing is None:
+            return
+        for attr in ("w:before", "w:after"):
+            val = spacing.get(qn(attr))
+            if val is not None:
+                try:
+                    if int(val) > MAX_SPACING:
+                        spacing.set(qn(attr), str(MAX_SPACING))
+                except ValueError:
+                    pass
+
+    for p in doc.paragraphs:
+        _fix_paragraph(p)
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for p in cell.paragraphs:
+                    _fix_paragraph(p)
+
+    # --- indent normalization for field labels ---
+    # collect left indents of short label-like paragraphs
+    indents = []
+    label_paras = []
+    for p in doc.paragraphs:
+        t = p.text.strip()
+        if t and len(t) < 40 and p._p.find(qn("w:pPr")) is not None:
+            ind_el = p._p.find(qn("w:pPr")).find(qn("w:ind"))
+            if ind_el is not None:
+                left = ind_el.get(qn("w:left"))
+                if left is not None:
+                    try:
+                        indents.append(int(left))
+                        label_paras.append((p, int(left)))
+                    except ValueError:
+                        pass
+    if indents:
+        # dominant indent = most common value
+        from collections import Counter
+        dominant, _ = Counter(indents).most_common(1)[0]
+        # snap outliers (differ by more than 500 twips ~ 0.35") to dominant
+        for p, left in label_paras:
+            if abs(left - dominant) > 500:
+                ind_el = p._p.find(qn("w:pPr")).find(qn("w:ind"))
+                ind_el.set(qn("w:left"), str(dominant))
+
+
+def _acro_widget_ys(pdf_path: str, field_types: tuple[int, ...]) -> dict[int, list[float]]:
+    """Map page index (0-based) -> y-centers of AcroForm widgets of the given
+    types, in order. Fallback geometry when the vision model omits bboxes.
+    Types: 2=checkbox, 5=radio button."""
+    out: dict[int, list[float]] = {}
+    try:
+        import fitz
+        d = fitz.open(pdf_path)
+        for pno in range(len(d)):
+            ys = []
+            for w in d[pno].widgets():
+                if w.field_type in field_types:
+                    r = w.rect
+                    ys.append((r.y0 + r.y1) / 2)
+            if ys:
+                out[pno] = ys
+        d.close()
+    except Exception:
+        pass
+    return out
+
+
+def _acro_checkbox_ys(pdf_path: str) -> dict[int, list[float]]:
+    """Backward-compat wrapper."""
+    return _acro_widget_ys(pdf_path, (2, 5))
+
+
+def _clear_paragraph(p) -> None:
+    from docx.oxml.ns import qn
+    pPr = p._p.find(qn("w:pPr"))
+    p._p.clear()
+    if pPr is not None:
+        p._p.insert(0, pPr)
+
+
+def _repair_checkbox_group(doc, items: list[tuple[str, bool]]) -> bool:
+    """Find the container holding >=2 of these labels mashed together and
+    replace it with a clean full-width paragraph: ☐/☒ + label per item."""
+    return _repair_widget_group(doc, items, "☐", "☒")
+
+
+def _repair_radio_group(doc, items: list[tuple[str, bool]]) -> bool:
+    """Replace a radio-button widget row with clean ○/◉ + label runs."""
+    return _repair_widget_group(doc, items, "○", "◉")
+
+
+def _repair_widget_group(doc, items: list[tuple[str, bool]],
+                         glyph_off: str, glyph_on: str) -> bool:
+    """Find the container holding >=2 of these labels and replace it with a
+    clean full-width paragraph: glyph + label per item."""
+    from docx.oxml.ns import qn
+    from docx.shared import Pt
+    labels = [lbl for lbl, _ in items if lbl]
+
+    def _build_paragraph():
+        p = doc.add_paragraph()
+        # neutralize spacing so it sits like a normal line, but keep the
+        # standard field indent (1224 twips) so widget rows align with labels
+        pPr = p._p.get_or_add_pPr()
+        for tag in ("w:spacing",):
+            el = pPr.find(qn(tag))
+            if el is not None:
+                pPr.remove(el)
+        ind = pPr.find(qn("w:ind"))
+        if ind is None:
+            ind = pPr.makeelement(qn("w:ind"), {})
+            pPr.append(ind)
+        ind.set(qn("w:left"), "1224")
+        for i, (label, checked) in enumerate(items):
+            if i > 0:
+                p.add_run("    ")
+            glyph = glyph_on if checked else glyph_off
+            r = p.add_run(f"{glyph} {label}")
+            r.font.size = Pt(9)
+        return p
+
+    # layout tables first (pdf2docx puts widget rows in them)
+    for table in doc.tables:
+        for row in table.rows:
+            n = sum(1 for cell in row.cells
+                    for lbl in labels if lbl in cell.text)
+            if n >= 2:
+                new_p = _build_paragraph()
+                tbl_el = table._tbl
+                tbl_el.addprevious(new_p._p)
+                tbl_el.getparent().remove(tbl_el)
+                return True
+    for p in doc.paragraphs:
+        if sum(1 for lbl in labels if lbl in p.text) >= 2:
+            new_p = _build_paragraph()
+            p._p.addprevious(new_p._p)
+            p._p.getparent().remove(p._p)
+            return True
+    return False
+
+
+def _repair_side_by_side_images(doc, pdf_path: str) -> None:
+    """Restore horizontal image arrangements that pdf2docx stacked vertically."""
+    import fitz
+    from docx.oxml.ns import qn
+
+    DRAWING_NS = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+
+    def _para_images(p):
+        out = []
+        for inl in p._p.findall(f".//{{{DRAWING_NS}}}inline"):
+            ext = inl.find(f"{{{DRAWING_NS}}}extent")
+            if ext is not None:
+                out.append(float(ext.get("cx")) / float(ext.get("cy")))
+        return out
+
+    # source geometry: image rects per page
+    src = fitz.open(pdf_path)
+    try:
+        page_groups = []  # list of (page_idx, [(x0, aspect), ...]) for side-by-side rows
+        for pno in range(len(src)):
+            page = src[pno]
+            rects = []
+            for im in page.get_images(full=True):
+                rs = page.get_image_rects(im[0])
+                if rs:
+                    r = rs[0]
+                    if r.width > 20 and r.height > 20:
+                        rects.append((r.x0, r.y0, r.x1, r.y1))
+            # group rects into rows by y-overlap
+            rows: list[list[tuple]] = []
+            for r in sorted(rects, key=lambda r: r[1]):
+                placed = False
+                for row in rows:
+                    if abs(r[1] - row[0][1]) < max(r[3] - r[1], row[0][3] - row[0][1]) * 0.5:
+                        row.append(r)
+                        placed = True
+                        break
+                if not placed:
+                    rows.append([r])
+            for row in rows:
+                if len(row) >= 2:
+                    row_sorted = sorted(row, key=lambda r: r[0])
+                    aspects = [((rr[2] - rr[0]) / (rr[3] - rr[1]), rr[0]) for rr in row_sorted]
+                    page_groups.append((pno, aspects))
+    finally:
+        src.close()
+    if not page_groups:
+        return
+
+    # docx image paragraphs (in document order) with aspect ratios
+    img_paras = []
+    for p in doc.paragraphs:
+        aspects = _para_images(p)
+        if aspects and not p.text.strip():
+            img_paras.append((p, aspects[0]))
+
+    used = set()
+    for _pno, aspects in page_groups:
+        # match each source aspect to an unused docx image paragraph
+        matched = []
+        for asp, _x0 in aspects:
+            best, best_d = None, 0.15
+            for idx, (p, pa) in enumerate(img_paras):
+                if idx in used:
+                    continue
+                d = abs(pa - asp) / max(asp, 0.01)
+                if d < best_d:
+                    best, best_d = (idx, p), d
+            if best:
+                matched.append(best)
+                used.add(best[0])
+        if len(matched) >= 2:
+            _merge_images_into_table(doc, [p for _, p in matched])
+
+
+def _merge_images_into_table(doc, paras) -> None:
+    """Move image paragraphs into a single-row borderless table, in order."""
+    from docx.oxml.ns import qn
+    DRAWING_NS = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+    if len(paras) < 2:
+        return
+    first = paras[0]
+    table = doc.add_table(rows=1, cols=len(paras))
+    table.autofit = True
+    # strip borders
+    tblPr = table._tbl.tblPr
+    borders = tblPr.makeelement(qn("w:tblBorders"), {})
+    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        borders.append(borders.makeelement(
+            qn(f"w:{edge}"),
+            {qn("w:val"): "nil", qn("w:sz"): "0",
+             qn("w:space"): "0", qn("w:color"): "auto"}))
+    tblPr.append(borders)
+    # move each image run into its cell, then insert table before first para
+    # scale images down to fit their cell (usable width ~3.2" each)
+    max_cx = int(Inches(3.2).emu)
+    for i, p in enumerate(paras):
+        cell = table.cell(0, i)
+        cell_par = cell.paragraphs[0]
+        for r in p._p.findall(qn("w:r")):
+            for inl in r.findall(f".//{{{DRAWING_NS}}}inline"):
+                ext = inl.find(f"{{{DRAWING_NS}}}extent")
+                if ext is not None:
+                    cx = int(ext.get("cx"))
+                    if cx > max_cx:
+                        cy = int(ext.get("cy"))
+                        new_cy = int(cy * max_cx / cx)
+                        ext.set("cx", str(max_cx))
+                        ext.set("cy", str(new_cy))
+            cell_par._p.append(r)
+    tbl_el = table._tbl
+    first._p.addprevious(tbl_el)
+    for p in paras:
+        p._p.getparent().remove(p._p)
+
+
+def convert_to_docx(    pdf_path: str,
     output_path: str,
     pages_data: list[dict],
     page_dims: list[tuple[float, float]] | None = None,
@@ -2129,6 +2919,13 @@ def convert_to_docx(
 
     if not converted:
         build_docx(pages_data, output_path, page_dims=page_dims, title=title)
+    else:
+        # pdf2docx visual path: repair its known failure modes (dropped
+        # checkbox glyphs, stacked side-by-side images) from ground truth.
+        try:
+            _repair_visual_docx(output_path, pdf_path, pages_data)
+        except Exception as e:
+            print(f"  [visual repair skipped: {e}]")
 
     if Path(output_path).exists():
         make_docx_accessible(output_path, pages_data)
