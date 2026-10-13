@@ -2,6 +2,7 @@
 Stripe billing routes: success, cancel, webhook.
 """
 
+import stripe
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
@@ -17,7 +18,22 @@ router = APIRouter(prefix="/billing")
 
 @router.get("/success")
 async def billing_success(session_id: str, job_id: str):
-    """Stripe redirects here after successful one-time payment. Release the job."""
+    """
+    Stripe redirects here after checkout. The redirect params alone are NOT
+    trusted — anyone can forge this URL. Verify payment server-side before
+    releasing the job.
+    """
+    try:
+        session = stripe.checkout.Session.retrieve(session_id)
+    except Exception:
+        raise HTTPException(400, "Could not verify payment with Stripe")
+    if session.payment_status != "paid":
+        raise HTTPException(402, "Payment not completed")
+    # Bind the session to this job: the checkout session's metadata must
+    # name this job_id, so one paid session can't release a different job.
+    if (session.metadata or {}).get("job_id") != job_id:
+        raise HTTPException(400, "Checkout session does not match this job")
+
     job = get_job(job_id)
     if not job:
         raise HTTPException(404, "Job not found")

@@ -49,6 +49,25 @@ def create_checkout_session(page_count: int, job_id: str) -> str | None:
     if not billing["requires_payment"]:
         return None
 
+    return _create_checkout_session(billing, job_id)
+
+
+def create_checkout_session_for_billing(billing: dict, job_id: str) -> str | None:
+    """
+    Create a Stripe Checkout session from an explicit billing breakdown.
+    Used for anonymous users, whose free allowance comes from the per-IP
+    monthly free tier rather than calculate_charge()'s per-document default.
+    Returns the session URL, or None if Stripe is not configured.
+    """
+    if not STRIPE_SECRET_KEY:
+        return None
+    if not billing.get("requires_payment"):
+        return None
+    return _create_checkout_session(billing, job_id)
+
+
+def _create_checkout_session(billing: dict, job_id: str) -> str:
+    """Build the Stripe Checkout session for a precomputed billing dict."""
     amount_cents = int(billing["amount_usd"] * 100)
 
     session = stripe.checkout.Session.create(
@@ -70,7 +89,7 @@ def create_checkout_session(page_count: int, job_id: str) -> str | None:
         mode="payment",
         success_url=f"{APP_URL}/billing/success?session_id={{CHECKOUT_SESSION_ID}}&job_id={job_id}",
         cancel_url=f"{APP_URL}/billing/cancel?job_id={job_id}",
-        metadata={"job_id": job_id, "page_count": page_count},
+        metadata={"job_id": job_id, "page_count": billing["total_pages"]},
     )
     return session.url
 

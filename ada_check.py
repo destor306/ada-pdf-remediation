@@ -24,6 +24,12 @@ Runs a layered check stack against a remediated .docx and/or exported .pdf:
     • Full PDF/UA-1 (ISO 14289-1) conformance check
     • Reports clause-level failures
 
+Layer 4 — Visual similarity (runs if LibreOffice available)
+    • Renders the generated DOCX to PDF via LibreOffice headless and
+      diffs it against the source PDF at 150 DPI grayscale
+    • Deliberately does NOT diff the tagged output PDF: that file is the
+      source with tags injected, so such a diff scores ~100% by construction
+
 Usage:
   python3 ada_check.py source.pdf remediated.docx [remediated.pdf]
 
@@ -36,6 +42,7 @@ Install VeraPDF (optional but recommended for production):
 import sys
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import json
@@ -207,29 +214,57 @@ def check_table_headers(doc: Document, report: CheckReport):
         report.ok("Tables", "All tables have header rows marked")
 
 
+# Placeholder alt text the pipeline writes when the AI produced no real
+# description. These are not meaningful alternatives — flag them as failures.
+GENERIC_ALT_TEXT = {"figure", "image", "picture", "graphic", "img", "photo"}
+
+
+def _is_generic_alt(text: str) -> bool:
+    return text.strip().lower() in GENERIC_ALT_TEXT
+
+
 def check_alt_text(doc: Document, report: CheckReport):
-    """Inline images should have alt text (wp:docPr descr attribute)."""
+    """
+    Every image — inline (wp:inline) AND floating (wp:anchor) — needs real
+    alt text in wp:docPr/descr. Missing text fails, and so do placeholder
+    values like "Figure" that the pipeline writes when no AI description
+    exists: a placeholder is not a text alternative.
+    """
     ns = {
         "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
         "wp": "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
         "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
     }
-    inline_images = doc.element.body.findall(".//wp:inline", ns)
-    if not inline_images:
-        report.ok("Alt Text", "No inline images found")
+    images = (
+        doc.element.body.findall(".//wp:inline", ns)
+        + doc.element.body.findall(".//wp:anchor", ns)
+    )
+    if not images:
+        report.ok("Alt Text", "No images found")
         return
 
     missing = 0
-    for img in inline_images:
+    generic = 0
+    for img in images:
         docPr = img.find("wp:docPr", ns)
         descr = docPr.get("descr", "").strip() if docPr is not None else ""
         if not descr:
             missing += 1
+        elif _is_generic_alt(descr):
+            generic += 1
 
-    if missing:
-        report.error("Alt Text", f"{missing}/{len(inline_images)} image(s) missing alt text (descr attribute)")
+    if missing or generic:
+        parts = []
+        if missing:
+            parts.append(f"{missing} missing alt text (descr attribute)")
+        if generic:
+            parts.append(
+                f"{generic} with placeholder alt text (e.g. 'Figure') — "
+                "needs a real description of what the image conveys"
+            )
+        report.error("Alt Text", f"{len(images)} image(s) checked: " + "; ".join(parts))
     else:
-        report.ok("Alt Text", f"All {len(inline_images)} image(s) have alt text")
+        report.ok("Alt Text", f"All {len(images)} image(s) have descriptive alt text")
 
 
 def check_language(doc: Document, report: CheckReport):
@@ -288,6 +323,70 @@ def check_text_coverage(source_pdf: str, doc: Document, report: CheckReport):
         report.warn("Coverage", f"Missing words sample: {', '.join(sorted(missing)[:20])}")
 
 
+def _word_stream(text: str) -> list:
+    """Normalized word list (same filtering as coverage) preserving order."""
+    return [
+        w.lower().strip(".,;:()[]\"'")
+        for w in text.split()
+        if len(w.strip(".,;:()[]\"'")) > 2
+    ]
+
+
+def _lcs_ratio(a: list, b: list, cap: int = 3000) -> float:
+    """
+    Order-aware similarity: longest-common-subsequence length over
+    max(len(a), len(b)). Streams are capped for speed; the cap covers
+    far more than a typical remediated document's distinctive vocabulary.
+    """
+    import difflib
+    a, b = a[:cap], b[:cap]
+    if not a or not b:
+        return 0.0
+    matcher = difflib.SequenceMatcher(None, a, b, autojunk=False)
+    matches = sum(block.size for block in matcher.get_matching_blocks())
+    return matches / max(len(a), len(b))
+
+
+def check_reading_order(source_pdf: str, doc: Document, report: CheckReport):
+    """
+    The bag-of-words coverage check is blind to scrambled reading order —
+    words in the wrong section still "cover" the source vocabulary.
+    This check compares word *sequences*, catching order corruption.
+    """
+    with pdfplumber.open(source_pdf) as pdf:
+        source_text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+
+    # True document order (paragraphs and tables interleaved as they appear),
+    # not python-docx's paragraphs-then-tables split which would itself
+    # scramble the sequence being measured.
+    from docx.table import Table
+    parts = []
+    for block in _iter_block_items(doc):
+        if isinstance(block, Table):
+            for row in block.rows:
+                for cell in row.cells:
+                    parts.append(cell.text)
+        else:
+            parts.append(block.text)
+    output_text = "\n".join(parts)
+
+    src_words = _word_stream(source_text)
+    out_words = _word_stream(output_text)
+    if not src_words:
+        report.warn("Reading Order", "Could not extract text from source PDF for comparison")
+        return
+
+    ratio = _lcs_ratio(src_words, out_words)
+    pct = ratio * 100
+
+    if pct >= 90:
+        report.ok("Reading Order", f"Reading order preserved: {pct:.1f}% sequence match")
+    elif pct >= 75:
+        report.warn("Reading Order", f"Reading order: {pct:.1f}% sequence match — some content may be out of order")
+    else:
+        report.error("Reading Order", f"Reading order: {pct:.1f}% sequence match — text order differs significantly from source")
+
+
 def check_empty_headings(doc: Document, report: CheckReport):
     """Headings must not be empty."""
     empty = 0
@@ -309,6 +408,7 @@ def run_docx_checks(source_pdf: str, docx_path: str, report: CheckReport):
     check_table_headers(doc, report)
     check_alt_text(doc, report)
     check_text_coverage(source_pdf, doc, report)
+    check_reading_order(source_pdf, doc, report)
 
 
 # ---------------------------------------------------------------------------
@@ -511,69 +611,127 @@ def find_verapdf() -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Layer 3: Visual similarity check (source PDF vs output PDF)
+# Layer 3: Visual similarity check (source PDF vs rendered DOCX)
 # ---------------------------------------------------------------------------
 
-def check_visual_similarity(source_pdf: str, output_pdf: str, report: CheckReport):
+def _render_docx_to_pdf(docx_path: str, out_dir: str) -> str | None:
     """
-    Render both PDFs to images and compare them using pixel-level diff.
-    Uses Pillow only — no API, no internet, completely free.
+    Render a DOCX to PDF via LibreOffice headless.
+    Uses a per-call user-profile temp dir so concurrent runs don't collide.
+    Returns the rendered PDF path, or None if LibreOffice is unavailable/fails.
+    """
+    import shutil
 
-    Threshold: >85% pixel similarity per page = PASS.
+    soffice = shutil.which("soffice") or shutil.which("libreoffice")
+    if not soffice:
+        return None
+
+    tmp_profile = tempfile.mkdtemp(prefix="lo_profile_")
+    try:
+        subprocess.run(
+            [
+                soffice,
+                "--headless",
+                f"-env:UserInstallation=file://{tmp_profile}",
+                "--convert-to", "pdf",
+                "--outdir", out_dir,
+                docx_path,
+            ],
+            capture_output=True,
+            timeout=180,
+        )
+        # LibreOffice exits non-zero on Java warnings even when conversion
+        # succeeds, so check for the output file rather than the return code.
+        rendered = Path(out_dir) / (Path(docx_path).stem + ".pdf")
+        return str(rendered) if rendered.exists() else None
+    except Exception:
+        return None
+    finally:
+        shutil.rmtree(tmp_profile, ignore_errors=True)
+
+
+def check_visual_similarity(source_pdf: str, docx_path: str, report: CheckReport):
+    """
+    Render the generated DOCX to PDF via LibreOffice headless and diff THAT
+    against the source PDF.
+
+    NOTE on what this does NOT do: it does not diff the tagged output PDF.
+    The tagged PDF is the source file with a struct tree injected, so a
+    source-vs-tagged diff scores 100% by construction and can never catch a
+    "looks off" document. The DOCX is the editable deliverable the user
+    actually reads — that is what gets compared here.
+
+    Threshold: >=90% pixel similarity per page at 150 DPI grayscale = PASS.
     """
     try:
         from PIL import Image, ImageChops
-        import math
     except ImportError:
         report.warn("Visual Match", "Pillow not installed — skipping visual check (pip install pillow)")
         return
 
+    tmp_dir = tempfile.mkdtemp(prefix="visual_check_")
     try:
-        src_images = convert_from_path(source_pdf, dpi=72)   # low DPI for speed
-        out_images = convert_from_path(output_pdf, dpi=72)
-    except Exception as e:
-        report.warn("Visual Match", f"Could not render PDFs for comparison: {e}")
-        return
+        rendered_pdf = _render_docx_to_pdf(docx_path, tmp_dir)
+        if not rendered_pdf:
+            report.warn(
+                "Visual Match",
+                "LibreOffice not available — skipping DOCX visual check "
+                "(install LibreOffice for meaningful layout verification)",
+            )
+            return
 
-    page_count = min(len(src_images), len(out_images))
-    if len(src_images) != len(out_images):
-        report.warn("Visual Match", f"Page count mismatch: source={len(src_images)}, output={len(out_images)}")
+        try:
+            src_images = convert_from_path(source_pdf, dpi=150)
+            out_images = convert_from_path(rendered_pdf, dpi=150)
+        except Exception as e:
+            report.warn("Visual Match", f"Could not render PDFs for comparison: {e}")
+            return
 
-    total_similarity = 0.0
-    low_similarity_pages = []
+        page_count = min(len(src_images), len(out_images))
+        if len(src_images) != len(out_images):
+            report.warn("Visual Match", f"Page count mismatch: source={len(src_images)}, rendered docx={len(out_images)}")
 
-    for i in range(page_count):
-        src = src_images[i].convert("L")   # grayscale
-        out = out_images[i].convert("L")
+        if page_count == 0:
+            report.warn("Visual Match", "No pages rendered for comparison")
+            return
 
-        # Resize output to match source dimensions
-        if src.size != out.size:
-            out = out.resize(src.size, Image.LANCZOS)
+        total_similarity = 0.0
+        low_similarity_pages = []
 
-        diff = ImageChops.difference(src, out)
-        total_pixels = diff.width * diff.height
+        for i in range(page_count):
+            src = src_images[i].convert("L")   # grayscale
+            out = out_images[i].convert("L")
 
-        # Count pixels within acceptable tolerance (diff < 30/255)
-        hist = diff.histogram()  # 256-bucket histogram for grayscale
-        similar_pixels = sum(hist[:30])
-        similarity = similar_pixels / total_pixels
-        total_similarity += similarity
+            # Resize output to match source dimensions
+            if src.size != out.size:
+                out = out.resize(src.size, Image.LANCZOS)
 
-        if similarity < 0.85:
-            low_similarity_pages.append((i + 1, similarity))
+            diff = ImageChops.difference(src, out)
+            total_pixels = diff.width * diff.height
 
-    avg_similarity = total_similarity / page_count if page_count else 0
-    pct = avg_similarity * 100
+            # Count pixels within acceptable tolerance (diff < 30/255)
+            hist = diff.histogram()  # 256-bucket histogram for grayscale
+            similar_pixels = sum(hist[:30])
+            similarity = similar_pixels / total_pixels
+            total_similarity += similarity
 
-    if not low_similarity_pages:
-        report.ok("Visual Match", f"All {page_count} pages visually similar to source (avg {pct:.1f}% match)")
-    else:
-        for page_num, sim in low_similarity_pages:
-            report.warn("Visual Match", f"Page {page_num}: {sim*100:.1f}% visual match — layout may differ from original")
-        if avg_similarity < 0.70:
-            report.error("Visual Match", f"Overall visual match too low: {pct:.1f}% — output looks significantly different from source")
+            if similarity < 0.90:
+                low_similarity_pages.append((i + 1, similarity))
+
+        avg_similarity = total_similarity / page_count
+        pct = avg_similarity * 100
+
+        if not low_similarity_pages:
+            report.ok("Visual Match", f"All {page_count} pages visually similar to source (avg {pct:.1f}% match)")
         else:
-            report.warn("Visual Match", f"Average visual match: {pct:.1f}% — some pages differ from source")
+            for page_num, sim in low_similarity_pages:
+                report.warn("Visual Match", f"Page {page_num}: {sim*100:.1f}% visual match — layout may differ from original")
+            if avg_similarity < 0.70:
+                report.error("Visual Match", f"Overall visual match too low: {pct:.1f}% — output looks significantly different from source")
+            else:
+                report.warn("Visual Match", f"Average visual match: {pct:.1f}% — some pages differ from source")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def run_verapdf(pdf_path: str, report: CheckReport):
@@ -673,7 +831,7 @@ def main():
         else:
             check_pdf_tags(pdf_path, report)
             run_verapdf(pdf_path, report)
-            check_visual_similarity(source_pdf, pdf_path, report)
+            check_visual_similarity(source_pdf, docx_path, report)
     else:
         report.warn(
             "PDF Tags",

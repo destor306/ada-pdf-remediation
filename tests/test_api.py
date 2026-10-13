@@ -445,3 +445,84 @@ class TestComplexPdfApiFlow:
         job2 = resp2.json()["job_id"]
 
         assert job1 != job2, "Each /process call must produce a distinct job_id"
+
+
+# ── Anonymous free-tier enforcement ─────────────────────────────────────────
+
+def _make_test_pdf(path: Path, pages: int = 1):
+    """Generate a minimal multi-page PDF for free-tier tests."""
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.pagesizes import letter
+    c = canvas.Canvas(str(path), pagesize=letter)
+    for n in range(pages):
+        c.drawString(72, 720, f"Free tier test page {n + 1}")
+        c.showPage()
+    c.save()
+
+
+class TestAnonymousFreeTier:
+    """
+    The 3-pages/IP/month anonymous free tier must actually decrement on
+    /process. (Logged-in users are metered via pages_used in jobs.py.)
+    """
+
+    def _reset_usage(self):
+        from app import ratelimit
+        ratelimit._usage.clear()
+
+    def _upload_and_process(self, pdf_path: Path) -> dict:
+        with open(pdf_path, "rb") as f:
+            up = client.post(
+                "/api/upload",
+                files={"file": (pdf_path.name, f, "application/pdf")},
+            )
+        assert up.status_code == 200, up.text
+        proc = client.post(
+            "/api/process",
+            json={"upload_id": up.json()["upload_id"], "use_claude": False},
+        )
+        assert proc.status_code == 200, proc.text
+        return proc.json()
+
+    def test_free_tier_decrements_per_ip(self, tmp_path):
+        self._reset_usage()
+        pdf_path = tmp_path / "one.pdf"
+        _make_test_pdf(pdf_path, pages=1)
+
+        # 3 one-page documents → all free, no payment required
+        for _ in range(3):
+            data = self._upload_and_process(pdf_path)
+            assert data["status"] == "queued"
+            assert data["billing"]["requires_payment"] is False
+            assert data["billing"]["billable_pages"] == 0
+
+        usage = client.get("/api/usage").json()
+        assert usage["pages_used"] == 3
+        assert usage["pages_remaining"] == 0
+
+        # 4th one-page document → free tier exhausted: billed for the page
+        data = self._upload_and_process(pdf_path)
+        assert data["billing"]["requires_payment"] is True
+        assert data["billing"]["billable_pages"] == 1
+        assert data["billing"]["free_pages"] == 0
+        assert data["billing"]["amount_usd"] == pytest.approx(0.05)
+
+        # Usage stays capped at 3 — the extra page was billable, not free
+        usage = client.get("/api/usage").json()
+        assert usage["pages_used"] == 3
+        assert usage["pages_remaining"] == 0
+
+    def test_partial_free_allowance_bills_only_excess(self, tmp_path):
+        self._reset_usage()
+        from app import ratelimit
+        # Simulate 2 free pages already used this month → 1 remaining
+        ratelimit.consume_free_pages("testclient", 2)
+
+        pdf_path = tmp_path / "two.pdf"
+        _make_test_pdf(pdf_path, pages=2)
+        data = self._upload_and_process(pdf_path)
+
+        assert data["billing"]["requires_payment"] is True
+        assert data["billing"]["free_pages"] == 1
+        assert data["billing"]["billable_pages"] == 1
+        assert data["billing"]["amount_usd"] == pytest.approx(0.05)

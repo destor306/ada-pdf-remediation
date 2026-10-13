@@ -17,7 +17,7 @@ from app.config import (
     STRIPE_SECRET_KEY, APP_URL,
 )
 from app.jobs import create_job, get_job, start_job
-from app.billing import calculate_charge, create_checkout_session
+from app.billing import calculate_charge, create_checkout_session, create_checkout_session_for_billing
 from app.ratelimit import check_free_tier, consume_free_pages, get_usage
 from app.database import get_db
 from app.auth import get_current_user, pages_remaining, can_process_free
@@ -64,6 +64,23 @@ async def upload_pdf(
     # Persist original filename so download can use it
     (UPLOAD_DIR / f"{upload_id}.name").write_text(file.filename, encoding="utf-8")
 
+    # Reject password-protected PDFs with a clear message. pdfplumber raises
+    # an empty PdfminerException for these, which would surface as a cryptic
+    # "Could not read PDF: " with no detail — so detect encryption explicitly.
+    try:
+        import pikepdf
+        with pikepdf.open(str(pdf_path)):
+            pass
+    except pikepdf.PasswordError:
+        pdf_path.unlink(missing_ok=True)
+        raise HTTPException(
+            422,
+            "Password-protected PDFs are not supported. "
+            "Please remove the password and upload the file again.",
+        )
+    except Exception:
+        pass  # Not a password issue — the normal open below will report it.
+
     # Count pages
     try:
         import pdfplumber
@@ -71,7 +88,8 @@ async def upload_pdf(
             page_count = len(pdf.pages)
     except Exception as e:
         pdf_path.unlink(missing_ok=True)
-        raise HTTPException(422, f"Could not read PDF: {e}")
+        detail = str(e).strip() or "the file could not be parsed"
+        raise HTTPException(422, f"Could not read PDF: {detail}")
 
     if page_count > MAX_PAGES_HARD:
         pdf_path.unlink(missing_ok=True)
@@ -161,6 +179,60 @@ async def process_pdf(
                     "billing": dict(billing, requires_payment=False, amount_usd=0),
                 }
         # payg or insufficient remaining pages — fall through to Stripe
+
+    # Anonymous free tier: 3 pages per IP per calendar month, enforced here.
+    # (Logged-in users are metered via pages_used in jobs.py instead.)
+    # NOTE: calculate_charge() grants 3 free pages per *document*, so the IP
+    # allowance — not the per-document allowance — is the source of truth for
+    # anonymous users. Otherwise the monthly cap could never bite.
+    ip = request.client.host if request.client else "unknown"
+    if not user:
+        allowed, remaining = check_free_tier(ip, page_count)
+        if allowed:
+            # Whole document fits in the remaining free allowance.
+            consume_free_pages(ip, page_count)
+            start_job(job)
+            return {
+                "job_id": job.id,
+                "status": "queued",
+                "billing": {
+                    "total_pages": page_count,
+                    "free_pages": page_count,
+                    "billable_pages": 0,
+                    "amount_usd": 0.0,
+                    "requires_payment": False,
+                },
+            }
+        # Free tier exhausted (or document bigger than the remainder):
+        # bill every page beyond the remaining free allowance, and consume
+        # that remainder now so it can't be double-spent.
+        free_applied = min(remaining, page_count)
+        if free_applied:
+            consume_free_pages(ip, free_applied)
+        anon_billable = page_count - free_applied
+        anon_billing = {
+            "total_pages": page_count,
+            "free_pages": free_applied,
+            "billable_pages": anon_billable,
+            "amount_usd": round(anon_billable * PRICE_PER_PAGE, 2),
+            "requires_payment": anon_billable > 0,
+        }
+        if anon_billing["requires_payment"]:
+            checkout_url = create_checkout_session_for_billing(anon_billing, job.id)
+            if checkout_url:
+                return {
+                    "job_id": job.id,
+                    "status": "awaiting_payment",
+                    "checkout_url": checkout_url,
+                    "billing": anon_billing,
+                }
+        # Stripe not configured → start immediately, reporting honest billing.
+        start_job(job)
+        return {
+            "job_id": job.id,
+            "status": "queued",
+            "billing": anon_billing,
+        }
 
     # If payment required, create Stripe session
     if billing["requires_payment"]:
