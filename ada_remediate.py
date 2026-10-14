@@ -3454,7 +3454,18 @@ def convert_to_docx(    pdf_path: str,
     """
     Convert PDF to DOCX using pdf2docx for best visual fidelity, falling back to
     build_docx if pdf2docx is unavailable. Always runs accessibility post-processing.
+
+    Set CLEAN_DOCX=1 to skip pdf2docx and build the DOCX directly from the
+    vision model's elements (already in reading order). Used by the reading-order
+    head-to-head prototype (head_to_head.py).
     """
+    # Clean-build path: render from elements in reading order, no pdf2docx.
+    if os.environ.get("CLEAN_DOCX") == "1":
+        build_docx(pages_data, output_path, page_dims=page_dims, title=title)
+        if Path(output_path).exists():
+            make_docx_accessible(output_path, pages_data)
+        return
+
     converted = False
     try:
         from pdf2docx import Converter

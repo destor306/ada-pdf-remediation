@@ -247,7 +247,14 @@ def check_alt_text(doc: Document, report: CheckReport):
     generic = 0
     for img in images:
         docPr = img.find("wp:docPr", ns)
-        descr = docPr.get("descr", "").strip() if docPr is not None else ""
+        if docPr is None:
+            missing += 1
+            continue
+        # Decorative images (marked by the pipeline) are intentionally skipped
+        # by screen readers and don't need alt text.
+        if docPr.get("decorative") == "1":
+            continue
+        descr = docPr.get("descr", "").strip()
         if not descr:
             missing += 1
         elif _is_generic_alt(descr):
@@ -289,16 +296,15 @@ def check_text_coverage(source_pdf: str, doc: Document, report: CheckReport):
             for w in text.split():
                 source_words.add(w.lower().strip(".,;:()[]\"'"))
 
-    # Extract output words
+    # Extract output words via XPath .//w:t to catch ALL text, including
+    # nested tables, textboxes, and headers/footers that doc.paragraphs
+    # and doc.tables miss.
     output_words = set()
-    for para in doc.paragraphs:
-        for w in para.text.split():
-            output_words.add(w.lower().strip(".,;:()[]\"'"))
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                for w in cell.text.split():
-                    output_words.add(w.lower().strip(".,;:()[]\"'"))
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    for t_elem in doc.element.body.findall(".//w:t", ns):
+        if t_elem.text:
+            for w in t_elem.text.split():
+                output_words.add(w.lower().strip(".,;:()[]\"'"))
 
     # Filter out very short words (noise)
     source_words = {w for w in source_words if len(w) > 2}
