@@ -54,7 +54,7 @@ CLAUDE_COST_PER_PAGE = 0.025     # ~$0.02–0.03 estimate
 LOCAL_COST_PER_PAGE = 0.0        # free
 
 LOCAL_MODEL = os.environ.get("LOCAL_MODEL", "qwen2-vl:2b")
-CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-5-5")
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 
 # Poppler path (Windows — set via env or auto-detected)
@@ -89,9 +89,10 @@ def detect_backends() -> dict:
     except Exception:
         pass
 
-    # Check Claude
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if api_key and os.environ.get("NO_FALLBACK") != "1":
+    # Check Claude — via the workspace anthropic skill CLI (surrogate credential),
+    # not a raw ANTHROPIC_API_KEY env var.
+    cli_path = os.path.expanduser("~/workspace/skills/anthropic/bin/anthropic-cli")
+    if os.path.isfile(cli_path) and os.access(cli_path, os.X_OK) and os.environ.get("NO_FALLBACK") != "1":
         backends["claude"] = True
 
     # Mock mode — always available as last resort (text extraction, no AI)
@@ -612,38 +613,61 @@ def analyze_with_claude(pdf_path: str, page_num: int, text_hint: str = "", image
     `Form I-94 with "RE" notation`) — the model would emit it unescaped and
     corrupt the surrounding JSON. Forcing a tool call sidesteps that failure
     mode entirely.
+
+    Auth goes through the workspace anthropic skill's CLI (surrogate
+    credential), not a raw ANTHROPIC_API_KEY env var.
     """
-    import anthropic
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    client = anthropic.Anthropic(api_key=api_key)
+    import json
+    import subprocess
+    import tempfile
+    import os
     image_b64 = render_page_to_base64(pdf_path, page_num)
 
-    def _call() -> dict:
-        response = client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=8192,
-            temperature=0,
-            system=SYSTEM_PROMPT,
-            tools=[PAGE_ELEMENTS_TOOL],
-            tool_choice={"type": "tool", "name": "emit_page_elements"},
-            messages=[{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {"type": "base64", "media_type": "image/png", "data": image_b64},
-                    },
-                    {"type": "text", "text": user_message_text(page_num, text_hint, image_count)},
-                ],
-            }],
-        )
+    # Build the exact request body the SDK would send, then hand it to the
+    # skill CLI which attaches the surrogate credential.
+    # Note: Haiku 5.5+ rejects non-default temperature/top_p/top_k, so omit
+    # temperature for those models.
+    request_body = {
+        "model": CLAUDE_MODEL,
+        "max_tokens": 8192,
+        "system": SYSTEM_PROMPT,
+        "tools": [PAGE_ELEMENTS_TOOL],
+        "tool_choice": {"type": "tool", "name": "emit_page_elements"},
+        "messages": [{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/png", "data": image_b64},
+                },
+                {"type": "text", "text": user_message_text(page_num, text_hint, image_count)},
+            ],
+        }],
+    }
 
-        if response.stop_reason == "max_tokens":
+    cli_path = os.path.expanduser("~/workspace/skills/anthropic/bin/anthropic-cli")
+
+    def _call() -> dict:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(request_body, f)
+            body_file = f.name
+        try:
+            proc = subprocess.run(
+                [cli_path, "messages", "--body-file", body_file],
+                capture_output=True, text=True, timeout=300,
+            )
+        finally:
+            os.unlink(body_file)
+        if proc.returncode != 0:
+            raise RuntimeError(f"anthropic-cli failed: {proc.stderr[:500]}")
+        response = json.loads(proc.stdout)
+
+        if response.get("stop_reason") == "max_tokens":
             print(f"  [warn] Claude tool call hit max_tokens on page {page_num} — output may be incomplete")
 
-        for block in response.content:
-            if block.type == "tool_use":
-                result = dict(block.input)
+        for block in response.get("content", []):
+            if block.get("type") == "tool_use":
+                result = dict(block.get("input", {}))
                 result.setdefault("page", page_num)
 
                 # Occasionally the model serializes "elements" as a JSON string
@@ -667,7 +691,7 @@ def analyze_with_claude(pdf_path: str, page_num: int, text_hint: str = "", image
 
         # Model didn't call the tool (shouldn't happen with tool_choice forced) —
         # fall back to parsing whatever text it produced instead.
-        text = "".join(b.text for b in response.content if getattr(b, "type", None) == "text")
+        text = "".join(b.get("text", "") for b in response.get("content", []) if b.get("type") == "text")
         parsed = parse_json_response(text, page_num)
         parsed["elements"] = parsed.get("elements") or None
         return parsed
@@ -2253,6 +2277,103 @@ def _iter_all_paragraphs(container):
             yield block
 
 
+def _reorder_docx_reading_order(doc, pages_data: list[dict]) -> None:
+    """
+    Reorder top-level DOCX blocks to match the vision model's reading order.
+
+    pdf2docx emits blocks in its layout-analysis order, which scrambles the
+    sequence a screen reader follows. The vision model extracts elements in
+    true reading order — use that as ground truth.
+
+    Matches DOCX blocks to vision elements by text overlap, then reorders the
+    XML body children. Blocks with no clear match keep their relative order.
+    """
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
+    # Flatten vision elements in reading order with their text
+    vision_texts = []
+    for page in pages_data:
+        for elem in page.get("elements", []):
+            text = elem.get("text", "").strip()
+            if text and len(text) > 2:
+                vision_texts.append(text)
+
+    if not vision_texts:
+        return
+
+    # Get top-level blocks in current DOCX order
+    body = doc.element.body
+    blocks = []  # (xml_element, text)
+    for child in body.iterchildren():
+        if child.tag == qn("w:p"):
+            para = Paragraph(child, doc)
+            text = para.text.strip()
+            if text:
+                blocks.append((child, text))
+        elif child.tag == qn("w:tbl"):
+            table = Table(child, doc)
+            # Concatenate all cell text for matching
+            cell_texts = []
+            for row in table.rows:
+                for cell in row.cells:
+                    t = cell.text.strip()
+                    if t:
+                        cell_texts.append(t)
+            text = " ".join(cell_texts)
+            if text:
+                blocks.append((child, text))
+
+    if len(blocks) < 2:
+        return
+
+    # Match each block to the best vision element by text overlap
+    def _overlap_score(block_text: str, vision_text: str) -> float:
+        # Jaccard similarity on word sets
+        b_words = set(block_text.lower().split())
+        v_words = set(vision_text.lower().split())
+        if not b_words or not v_words:
+            return 0.0
+        intersection = len(b_words & v_words)
+        union = len(b_words | v_words)
+        return intersection / union if union else 0.0
+
+    # For each block, find the vision index with highest overlap
+    block_order = []
+    for xml_elem, block_text in blocks:
+        best_idx = -1
+        best_score = 0.0
+        # Only consider vision texts of similar length (avoid false matches)
+        for vi, vtext in enumerate(vision_texts):
+            # Skip if lengths differ too much (one is probably a fragment)
+            if abs(len(block_text) - len(vtext)) > max(len(block_text), len(vtext)) * 0.8:
+                continue
+            score = _overlap_score(block_text, vtext)
+            if score > best_score:
+                best_score = score
+                best_idx = vi
+        # Only use the match if it's reasonably confident
+        if best_score >= 0.3:
+            block_order.append((best_idx, xml_elem))
+        else:
+            # No confident match — keep in place (use a large index to sort last,
+            # preserving relative order among unmatched blocks)
+            block_order.append((float('inf'), xml_elem))
+
+    # Check if reordering is actually needed (avoid churn if already ordered)
+    current_indices = [idx for idx, _ in block_order if idx != float('inf')]
+    if current_indices == sorted(current_indices):
+        return  # Already in order
+
+    # Reorder: remove all blocks and re-add in vision order
+    # Unmatched blocks (inf) go last, preserving their relative order
+    sorted_blocks = sorted(block_order, key=lambda x: (x[0] == float('inf'), x[0]))
+    for _, xml_elem in sorted_blocks:
+        body.remove(xml_elem)
+    for _, xml_elem in sorted_blocks:
+        body.append(xml_elem)
+
+
 def make_docx_accessible(docx_path: str, pages_data: list[dict]) -> None:
     """
     Post-process a visually-converted DOCX to add semantic accessibility structure:
@@ -2376,18 +2497,33 @@ def make_docx_accessible(docx_path: str, pages_data: list[dict]) -> None:
         if trPr.find(qn("w:tblHeader")) is None:
             trPr.append(OxmlElement("w:tblHeader"))
 
-    # Alt text on inline images using AI-extracted descriptions
+    # Alt text on images using AI-extracted descriptions.
+    # Handle BOTH inline (wp:inline) and floating (wp:anchor) images —
+    # pdf2docx emits most images as floating anchors.
     ai_alts = [
-        elem.get("alt_text", "").strip() or "Figure"
+        elem.get("alt_text", "").strip()
         for page in pages_data
         for elem in page.get("elements", [])
-        if elem.get("type") == "image"
+        if elem.get("type") == "image" and elem.get("alt_text", "").strip()
     ]
     ns_wp = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
-    for i, img_elem in enumerate(doc.element.body.findall(f".//{{{ns_wp}}}inline")):
+    # Collect all images (inline + floating) in document order
+    all_images = (
+        doc.element.body.findall(f".//{{{ns_wp}}}inline")
+        + doc.element.body.findall(f".//{{{ns_wp}}}anchor")
+    )
+    for i, img_elem in enumerate(all_images):
         docPr = img_elem.find(f"{{{ns_wp}}}docPr")
         if docPr is not None and not docPr.get("descr", "").strip():
-            docPr.set("descr", ai_alts[i] if i < len(ai_alts) else "Figure")
+            if i < len(ai_alts):
+                # Vision model provided a real description for this image
+                docPr.set("descr", ai_alts[i])
+            else:
+                # No vision description available for this image. It's likely
+                # a pdf2docx artifact (tiny line, spacer, decorative element)
+                # rather than meaningful content. Mark as decorative so screen
+                # readers skip it instead of announcing "Figure".
+                docPr.set("decorative", "1")
 
     # Move footer/header text from body into actual DOCX section footer/header.
     # pdf2docx converts PDF drawString footer/header as body paragraphs — detect
@@ -2481,6 +2617,14 @@ def make_docx_accessible(docx_path: str, pages_data: list[dict]) -> None:
     # turning nextColumn breaks into nextPage breaks is the right call.
     _fix_multicolumn_sections(doc)
 
+    # Reorder blocks to match the vision model's reading order.
+    # pdf2docx's layout analysis scrambles the sequence; the AI's
+    # linearized element order is the accessibility ground truth.
+    try:
+        _reorder_docx_reading_order(doc, pages_data)
+    except Exception as e:
+        print(f"  [reading-order reorder skipped: {e}]")
+
     doc.save(docx_path)
 
 
@@ -2532,6 +2676,11 @@ def _repair_visual_docx(docx_path: str, pdf_path: str, pages_data: list[dict]) -
     1. Checkbox glyphs: pdf2docx drops AcroForm checkbox widgets entirely and
        mashes their labels together ("A B C" -> "ABC"). Rebuild each checkbox
        row as proper ☐/☒ glyph + label runs from the vision field data.
+    1b. Radio buttons: same treatment with ○/◉ glyphs.
+    1c. Text-field rows: pdf2docx linearizes side-by-side text-field rows
+       (First Name | Last Name) into single-column label/box pairs in
+       column-major order. Rebuild them as side-by-side layout tables from
+       AcroForm geometry.
     2. Side-by-side images: pdf2docx's layout analysis stacks horizontally
        arranged images vertically. Detect side-by-side image groups from the
        source PDF geometry and restore them into a borderless 2-column table,
@@ -2607,6 +2756,15 @@ def _repair_visual_docx(docx_path: str, pdf_path: str, pages_data: list[dict]) -
                          for i in g]
                 _repair_radio_group(doc, items)
 
+    # --- 1c. Text-field row repair -----------------------------------------
+    # pdf2docx linearizes side-by-side text-field rows (First Name | Last Name)
+    # into single-column label/box pairs in column-major order. Rebuild them
+    # as side-by-side layout tables from AcroForm geometry.
+    try:
+        _repair_field_rows(doc, pdf_path)
+    except Exception as e:
+        print(f"  [field-row repair skipped: {e}]")
+
     # --- 2. Side-by-side image repair --------------------------------------
     _repair_side_by_side_images(doc, pdf_path)
 
@@ -2615,7 +2773,117 @@ def _repair_visual_docx(docx_path: str, pdf_path: str, pages_data: list[dict]) -
     # spacing (up to 30pt). Cap it to match the source's compact density.
     _normalize_spacing(doc)
 
+    # --- 4. Word-mash repair ------------------------------------------------
+    # pdf2docx sometimes merges adjacent words into one token ("deduction or
+    # itemized" -> "deductionoritemized") when runs abut without a space.
+    # A screen reader reads the mash as gibberish. Split tokens that can be
+    # segmented into known PDF words.
+    try:
+        _repair_word_mashes(doc, pdf_path)
+    except Exception as e:
+        print(f"  [word-mash repair skipped: {e}]")
+
     doc.save(docx_path)
+
+
+def _repair_word_mashes(doc, pdf_path: str) -> None:
+    """Split concatenated words by segmenting against the PDF's vocabulary.
+
+    Builds a word set from the source PDF text layer, then for each DOCX
+    text run, splits any token that isn't a known word but can be segmented
+    into 2+ known words (e.g. "deductionoritemized" -> "deduction or itemized").
+    """
+    import re
+    import pdfplumber
+
+    # Build vocabulary from PDF text layer
+    vocab = set()
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            for w in re.findall(r"[A-Za-z]+", text):
+                vocab.add(w.lower())
+                # Also add common inflections stripped of trailing 's'
+                if len(w) > 3 and w.lower().endswith("s"):
+                    vocab.add(w.lower()[:-1])
+
+    if not vocab:
+        return
+
+    def _segment(token: str) -> list[str] | None:
+        """Try to split token into 2+ known words. Returns None if not possible."""
+        lower = token.lower()
+        # Don't touch tokens that are already valid words, too short, or
+        # contain digits/URLs (likely intentional, e.g. "www.irs.gov/form1040")
+        if lower in vocab or len(token) < 6:
+            return None
+        if re.search(r"\d|www\.|http|\.gov|\.com", token):
+            return None
+        # Dynamic programming word segmentation
+        n = len(lower)
+        # dp[i] = list of words segmenting lower[:i], or None
+        dp: list[list[str] | None] = [None] * (n + 1)
+        dp[0] = []
+        for i in range(1, n + 1):
+            for j in range(max(0, i - 20), i):  # max word length 20
+                if dp[j] is not None and lower[j:i] in vocab:
+                    dp[i] = dp[j] + [token[j:i]]  # preserve original case
+                    break
+        result = dp[n]
+        # Only accept if we got 2+ words (a real split, not just the token itself)
+        if result and len(result) >= 2:
+            return result
+        return None
+
+    fixed = 0
+    # Iterate all paragraphs including those in tables
+    for para in doc.paragraphs:
+        for run in para.runs:
+            if not run.text or " " not in run.text:
+                # Check each whitespace-separated token in the run
+                tokens = run.text.split(" ")
+                new_tokens = []
+                changed = False
+                for tok in tokens:
+                    # Strip punctuation for the check, preserve it in output
+                    m = re.match(r"^([^A-Za-z]*)([A-Za-z]+)([^A-Za-z]*)$", tok)
+                    if m:
+                        pre, core, post = m.groups()
+                        seg = _segment(core)
+                        if seg:
+                            new_tokens.append(pre + " ".join(seg) + post)
+                            changed = True
+                            fixed += 1
+                            continue
+                    new_tokens.append(tok)
+                if changed:
+                    run.text = " ".join(new_tokens)
+    # Also check tables (doc.paragraphs misses table cell paragraphs)
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    for run in para.runs:
+                        if not run.text:
+                            continue
+                        tokens = run.text.split(" ")
+                        new_tokens = []
+                        changed = False
+                        for tok in tokens:
+                            m = re.match(r"^([^A-Za-z]*)([A-Za-z]+)([^A-Za-z]*)$", tok)
+                            if m:
+                                pre, core, post = m.groups()
+                                seg = _segment(core)
+                                if seg:
+                                    new_tokens.append(pre + " ".join(seg) + post)
+                                    changed = True
+                                    fixed += 1
+                                    continue
+                            new_tokens.append(tok)
+                        if changed:
+                            run.text = " ".join(new_tokens)
+    if fixed:
+        print(f"  [info] Split {fixed} mashed word(s)")
 
 
 def _normalize_spacing(doc) -> None:
@@ -2762,23 +3030,303 @@ def _repair_widget_group(doc, items: list[tuple[str, bool]],
         return p
 
     # layout tables first (pdf2docx puts widget rows in them)
-    for table in doc.tables:
-        for row in table.rows:
-            n = sum(1 for cell in row.cells
-                    for lbl in labels if lbl in cell.text)
-            if n >= 2:
-                new_p = _build_paragraph()
-                tbl_el = table._tbl
-                tbl_el.addprevious(new_p._p)
-                tbl_el.getparent().remove(tbl_el)
-                return True
+    # NOTE: The table-deletion below is DISABLED — it was deleting entire
+    # tables (and all their content) when 2+ widget labels matched, causing
+    # catastrophic content loss (43% coverage). Widget glyphs are now handled
+    # via the non-destructive _clear_paragraph path only, and even that is
+    # conservative.
+    # for table in doc.tables:
+    #     for row in table.rows:
+    #         n = sum(1 for cell in row.cells
+    #                 for lbl in labels if lbl in cell.text)
+    #         if n >= 2:
+    #             new_p = _build_paragraph()
+    #             tbl_el = table._tbl
+    #             tbl_el.addprevious(new_p._p)
+    #             tbl_el.getparent().remove(tbl_el)
+    #             return True
     for p in doc.paragraphs:
-        if sum(1 for lbl in labels if lbl in p.text) >= 2:
+        # Only replace if the paragraph contains ONLY the widget labels
+        # (plus whitespace) — never delete a paragraph with other content.
+        p_text = p.text.strip()
+        labels_in_p = [lbl for lbl in labels if lbl and lbl in p_text]
+        if len(labels_in_p) >= 2:
+            # Check that removing the labels leaves nothing substantial
+            remaining = p_text
+            for lbl in labels_in_p:
+                remaining = remaining.replace(lbl, "").strip()
+            # If more than 10 chars remain, this paragraph has other content — skip it
+            if len(remaining) > 10:
+                continue
             new_p = _build_paragraph()
             p._p.addprevious(new_p._p)
             p._p.getparent().remove(p._p)
             return True
     return False
+
+
+def _acro_text_field_rows(pdf_path: str) -> list[list[dict]]:
+    """Group text/combobox AcroForm widgets into visual rows.
+
+    Returns a list of rows; each row is a left-to-right list of dicts with
+    name, geometry, and label (extracted from the PDF text layer just above
+    each widget). Ground truth for the side-by-side field-row repair.
+    """
+    import fitz
+    rows: list[list[dict]] = []
+    try:
+        d = fitz.open(pdf_path)
+    except Exception:
+        return rows
+    try:
+        for pno in range(len(d)):
+            page = d[pno]
+            words = page.get_text("words")
+            widgets = []
+            for w in page.widgets():
+                if w.field_type not in (4, 7):  # combobox, text field
+                    continue
+                r = w.rect
+                # label: the text line just above (or at the top edge of) the widget
+                cands = [
+                    wd for wd in words
+                    if r.y0 - 26 <= (wd[1] + wd[3]) / 2 <= r.y0 + 10
+                    and wd[2] > r.x0 - 5 and wd[0] < r.x1 + 5
+                ]
+                lines: dict[tuple, list] = {}
+                for wd in cands:
+                    lines.setdefault((wd[5], wd[6]), []).append(wd)
+                label = ""
+                if lines:
+                    best = max(lines.values(), key=lambda ws: sum(len(x[4]) for x in ws))
+                    label = " ".join(wd[4] for wd in sorted(best, key=lambda x: x[0]))
+                widgets.append({
+                    "name": w.field_name, "x0": r.x0, "x1": r.x1,
+                    "yc": (r.y0 + r.y1) / 2, "w_pt": r.width,
+                    "label": label, "page": pno,
+                })
+            # cluster widgets into rows by y-center (same 25pt tolerance as
+            # the checkbox/radio row grouping)
+            page_rows: list[list[dict]] = []
+            for wdg in sorted(widgets, key=lambda w: w["yc"]):
+                placed = False
+                for row in page_rows:
+                    if abs(wdg["yc"] - row[0]["yc"]) < 25:
+                        row.append(wdg)
+                        placed = True
+                        break
+                if not placed:
+                    page_rows.append([wdg])
+            for row in page_rows:
+                row.sort(key=lambda w: w["x0"])
+                rows.append(row)
+    finally:
+        d.close()
+    return rows
+
+
+def _add_field_box(cell, width_pt: float) -> None:
+    """Append a clean empty widget-appearance box (bordered 1x1 table).
+
+    Recreates pdf2docx's widget box from scratch: moving the original box
+    table carries a fixed 9360-dxa grid that breaks the enclosing layout
+    table's columns in renderers. Visual styling matches the original
+    (gray #878787 border, #f9f9f9 fill, 20pt exact height).
+    """
+    box = cell.add_table(rows=1, cols=1)
+    box.autofit = False
+    dxa = int(width_pt * 20)
+    tblPr = box._tbl.tblPr
+    tblW = tblPr.find(qn("w:tblW"))
+    if tblW is not None:
+        tblW.set(qn("w:w"), str(dxa))
+        tblW.set(qn("w:type"), "dxa")
+    grid = box._tbl.find(qn("w:tblGrid"))
+    if grid is not None:
+        for gc in grid.findall(qn("w:gridCol")):
+            gc.set(qn("w:w"), str(dxa))
+    tc = box.cell(0, 0)
+    tc.width = Pt(width_pt)
+    tcPr = tc._tc.get_or_add_tcPr()
+    borders = tcPr.makeelement(qn("w:tcBorders"), {})
+    for edge in ("top", "left", "bottom", "right"):
+        borders.append(borders.makeelement(
+            qn(f"w:{edge}"),
+            {qn("w:val"): "single", qn("w:sz"): "8",
+             qn("w:space"): "0", qn("w:color"): "878787"}))
+    tcPr.append(borders)
+    tcPr.append(tcPr.makeelement(
+        qn("w:shd"),
+        {qn("w:val"): "clear", qn("w:color"): "auto", qn("w:fill"): "f9f9f9"}))
+    trPr = box.rows[0]._tr.get_or_add_trPr()
+    trPr.append(trPr.makeelement(
+        qn("w:trHeight"), {qn("w:val"): "390", qn("w:hRule"): "exact"}))
+    trPr.append(trPr.makeelement(qn("w:tblHeader"), {}))
+
+
+def _repair_field_rows(doc, pdf_path: str) -> None:
+    """Rebuild side-by-side text-field rows that pdf2docx linearized.
+
+    pdf2docx emits multi-column form rows (e.g. First Name | Last Name) as
+    single-column label/box pairs in column-major order, so right-column
+    fields land far below their visual row and read as unrelated sections.
+    Using AcroForm geometry as ground truth, rows with 2+ text widgets are
+    rebuilt as 1xN borderless tables with each label+box side by side in
+    visual row-major order — mirroring the source layout. Rows where any
+    label or box can't be found with confidence are left untouched.
+    """
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
+    def _norm(t: str) -> str:
+        return " ".join(t.lower().split())
+
+    def _is_box_table(tbl) -> bool:
+        """A 1x1 table with empty text and visible cell borders — the
+        rendered appearance of an AcroForm text widget."""
+        try:
+            if len(tbl.rows) != 1 or len(tbl.columns) != 1:
+                return False
+            cell = tbl.cell(0, 0)
+            if cell.text.strip():
+                return False
+            tcPr = cell._tc.find(qn("w:tcPr"))
+            borders = tcPr.find(qn("w:tcBorders")) if tcPr is not None else None
+            if borders is None:
+                return False
+            for edge in ("top", "left", "bottom", "right"):
+                e = borders.find(qn(f"w:{edge}"))
+                if e is not None and e.get(qn("w:val")) not in (None, "nil", "none"):
+                    return True
+            return False
+        except Exception:
+            return False
+
+    rows = [
+        r for r in _acro_text_field_rows(pdf_path)
+        if len(r) >= 2 and all(w["label"] for w in r)
+    ]
+    if not rows:
+        return
+
+    body = doc.element.body
+    for row in rows:
+        children = list(body.iterchildren())
+        used: set[int] = set()
+        matched: list[tuple] = []  # (para_el, tbl_el, widget)
+        ok = True
+        for wdg in row:
+            want = _norm(wdg["label"])
+            found = None
+            for i, child in enumerate(children):
+                if id(child) in used or child.tag != qn("w:p"):
+                    continue
+                if _norm(Paragraph(child, doc).text) != want:
+                    continue
+                # the label's box must be the immediately following block
+                if i + 1 < len(children) and children[i + 1].tag == qn("w:tbl"):
+                    tbl = Table(children[i + 1], doc)
+                    if _is_box_table(tbl):
+                        found = (child, children[i + 1])
+                        break
+            if found is None:
+                ok = False
+                break
+            used.add(id(found[0]))
+            used.add(id(found[1]))
+            matched.append((*found, wdg))
+        if not ok:
+            continue
+
+        # build the 1xN borderless layout table (same border-stripping
+        # pattern as _merge_images_into_table)
+        table = doc.add_table(rows=1, cols=len(matched))
+        table.autofit = False
+        tblPr = table._tbl.tblPr
+        borders = tblPr.makeelement(qn("w:tblBorders"), {})
+        for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+            borders.append(borders.makeelement(
+                qn(f"w:{edge}"),
+                {qn("w:val"): "nil", qn("w:sz"): "0",
+                 qn("w:space"): "0", qn("w:color"): "auto"}))
+        tblPr.append(borders)
+        # mark the row as a header, matching every other table in this
+        # document (pdf2docx blanket-marks tblHeader, which is what the
+        # quality gate checks for)
+        trPr = table.rows[0]._tr.get_or_add_trPr()
+        trPr.append(trPr.makeelement(qn("w:tblHeader"), {}))
+        for i, (para_el, tbl_el, wdg) in enumerate(matched):
+            cell = table.cell(0, i)
+            cell.width = Pt(wdg["w_pt"])
+            for p in cell.paragraphs:
+                p._p.getparent().remove(p._p)
+
+        # insert the new table before the first matched block, THEN move the
+        # label/box elements into the cells (append reparents them out of the
+        # body automatically — moving first would make the table an ancestor
+        # of the insertion point)
+        first_el = matched[0][0]
+        # Capture alignment reference BEFORE inserting: the nearest
+        # neighboring box table's indent and width, so the new row aligns
+        # with surrounding full-width fields instead of sticking out.
+        ref_indent = None
+        ref_width = None
+        sib = first_el.getprevious()
+        while sib is not None and (ref_indent is None or ref_width is None):
+            if sib.tag == qn("w:tbl"):
+                rt = Table(sib, doc)
+                rpr = rt._tbl.tblPr
+                ri = rpr.find(qn("w:tblInd"))
+                if ri is not None and ri.get(qn("w:w")) and ref_indent is None:
+                    ref_indent = ri.get(qn("w:w"))
+                if len(rt.rows) == 1 and len(rt.columns) == 1 and ref_width is None:
+                    cw = rt.cell(0, 0)._tc.find(qn("w:tcPr"))
+                    cw = cw.find(qn("w:tcW")) if cw is not None else None
+                    if cw is not None and cw.get(qn("w:w")):
+                        ref_width = int(float(cw.get(qn("w:w"))))
+            sib = sib.getprevious()
+        first_el.addprevious(table._tbl)
+        # explicit total width so fixed-layout renders predictably
+        total_dxa = sum(int(w["w_pt"] * 20) for _, _, w in matched)
+        tblW = tblPr.find(qn("w:tblW"))
+        if tblW is not None:
+            tblW.set(qn("w:w"), str(total_dxa))
+            tblW.set(qn("w:type"), "dxa")
+        grid = table._tbl.find(qn("w:tblGrid"))
+        if grid is not None:
+            for gc, (_, _, wdg) in zip(grid.findall(qn("w:gridCol")), matched):
+                gc.set(qn("w:w"), str(int(wdg["w_pt"] * 20)))
+        for i, (para_el, tbl_el, wdg) in enumerate(matched):
+            cell = table.cell(0, i)
+            # neutralize pdf2docx's 0.85" left indent on the label — inside the
+            # new cell it must align to the cell's left edge, not the page margin
+            pPr = para_el.find(qn("w:pPr"))
+            if pPr is not None:
+                ind = pPr.find(qn("w:ind"))
+                if ind is not None:
+                    ind.set(qn("w:left"), "0")
+            cell._tc.append(para_el)  # reparents the label out of the body
+            # drop pdf2docx's original box table and recreate it cleanly:
+            # moving it carries a fixed 9360-dxa grid that collapses the new
+            # table's columns in renderers
+            tbl_el.getparent().remove(tbl_el)
+            _add_field_box(cell, wdg["w_pt"])
+        # Apply the captured width alignment only (no indent — w:tblInd
+        # breaks Word pagination; width alone gets the right edge aligned).
+        if ref_width:
+            grid = table._tbl.find(qn("w:tblGrid"))
+            cols = grid.findall(qn("w:gridCol")) if grid is not None else []
+            cur_total = sum(int(c.get(qn("w:w"))) for c in cols if c.get(qn("w:w")))
+            if cur_total > 0 and cols:
+                scale = ref_width / cur_total
+                for c in cols:
+                    c.set(qn("w:w"), str(int(int(c.get(qn("w:w"))) * scale)))
+                tblW_el = tblPr.find(qn("w:tblW"))
+                if tblW_el is not None:
+                    tblW_el.set(qn("w:w"), str(ref_width))
+                    tblW_el.set(qn("w:type"), "dxa")
+        print(f"  [field-row repair: rebuilt {len(matched)}-column row "
+              f"({', '.join(w['label'] for _, _, w in matched)})]")
 
 
 def _repair_side_by_side_images(doc, pdf_path: str) -> None:
@@ -3018,14 +3566,19 @@ def main():
 
     for page_num in range(1, pages_to_process + 1):
         complexity = complexities[page_num]
-        if os.environ.get("MOCK_MODE") == "1":
+        # Label must reflect the backend that will ACTUALLY run, not the plan.
+        # backends["mock"] is True when no real backend is available (not just
+        # when MOCK_MODE=1 is forced).
+        if os.environ.get("MOCK_MODE") == "1" or backends["mock"]:
             label = "mock"
         elif complexity == "simple":
             label = "simple"
         elif backends["ollama"]:
             label = "ollama"
-        else:
+        elif backends["claude"]:
             label = "claude"
+        else:
+            label = "mock"
         print(f"  Page {page_num}/{pages_to_process} [{label}]...", end=" ", flush=True)
         page_data = analyze_page(pdf_path, page_num, text_layers.get(page_num, ""), backends)
         pages_data.append(page_data)
