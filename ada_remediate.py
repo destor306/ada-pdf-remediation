@@ -50,7 +50,7 @@ LARGE_DOC_THRESHOLD = 50         # pages — prompt user confirmation above this
 MAX_PAGES = 500                  # hard cap
 
 # Cost constants (USD)
-CLAUDE_COST_PER_PAGE = 0.025     # ~$0.02–0.03 estimate
+CLAUDE_COST_PER_PAGE = 0.003      # Haiku 5.5 measured ~$0.0022–0.0025/page (corpus re-run 2026-10-14, head-to-head 2026-10-15)
 LOCAL_COST_PER_PAGE = 0.0        # free
 
 LOCAL_MODEL = os.environ.get("LOCAL_MODEL", "qwen2-vl:2b")
@@ -217,8 +217,34 @@ def _page_has_form_fields(pdf_path: str, page_num: int) -> bool:
         return False
 
 
+def page_is_scanned(pdf_path: str, page_num: int) -> bool:
+    """True if the page is a scanned image: no extractable text, but image content.
+
+    A page with no text layer and no image content is treated as genuinely
+    blank, not scanned — the image check distinguishes real scans from
+    empty pages.
+    """
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            page = pdf.pages[page_num - 1]
+            text = page.extract_text() or ""
+            if text.strip():
+                return False
+            return len(page.images) > 0
+    except Exception:
+        return False
+
+
 def classify_page_complexity(pdf_path: str, page_num: int) -> str:
-    """Return 'simple' (text only) or 'complex' (has tables, images, or form fields)."""
+    """Return 'simple' (text only) or 'complex' (has tables, images, or form fields).
+
+    Scanned pages (image of text, no text layer) classify as 'complex' so
+    they are routed to the vision path automatically — OCR comes free with
+    the vision analysis, and the tagged-PDF output keeps the scanned image
+    as the visual layer with a structured text layer underneath.
+    """
+    if page_is_scanned(pdf_path, page_num):
+        return "complex"
     with pdfplumber.open(pdf_path) as pdf:
         page = pdf.pages[page_num - 1]
         if page.extract_tables():
@@ -414,8 +440,14 @@ WCAG 2.1 LEVEL AA KEY SUCCESS CRITERIA FOR DOCUMENTS (28 CFR Part 35 / DOJ Final
 """
 
 
-def user_message_text(page_num: int, text_hint: str, image_count: int = 0) -> str:
-    hint = f"\nRaw text layer hint (may be garbled):\n{text_hint[:2000]}" if text_hint.strip() else ""
+def user_message_text(page_num: int, text_hint: str, image_count: int = 0, scanned: bool = False) -> str:
+    if text_hint.strip():
+        hint = f"\nRaw text layer hint (may be garbled):\n{text_hint[:2000]}"
+    elif scanned:
+        hint = ("\nNote: this page is a scanned image with no extractable text — "
+                "transcribe everything you see, including all text, tables, form labels, and fine print.")
+    else:
+        hint = ""
     img_note = (
         f"\nThis page contains {image_count} embedded image(s) (charts, photos, signatures, logos). "
         f"Include exactly {image_count} element(s) of type \"image\" in reading order, each with descriptive alt_text."
@@ -519,7 +551,7 @@ def analyze_with_ollama(pdf_path: str, page_num: int, text_hint: str = "", image
         combined = (
             f"{SYSTEM_PROMPT}\n\n"
             f"---\n"
-            f"{user_message_text(page_num, text_hint, image_count)}"
+            f"{user_message_text(page_num, text_hint, image_count, scanned=page_is_scanned(pdf_path, page_num))}"
         )
 
         response = client.chat(
@@ -640,7 +672,7 @@ def analyze_with_claude(pdf_path: str, page_num: int, text_hint: str = "", image
                     "type": "image",
                     "source": {"type": "base64", "media_type": "image/png", "data": image_b64},
                 },
-                {"type": "text", "text": user_message_text(page_num, text_hint, image_count)},
+                {"type": "text", "text": user_message_text(page_num, text_hint, image_count, scanned=page_is_scanned(pdf_path, page_num))},
             ],
         }],
     }
@@ -3566,6 +3598,13 @@ def main():
     complex_count = sum(1 for v in complexities.values() if v == "complex")
     print(f"  Simple (text only, no AI): {simple_count} page(s)")
     print(f"  Complex (tables/images, AI needed): {complex_count} page(s)")
+    # Scanned pages (image-only, no text layer) classify as complex so the
+    # cost estimate already counts them — call them out explicitly here.
+    scanned_pages = sorted(n for n in range(1, pages_to_process + 1)
+                           if complexities[n] == "complex" and page_is_scanned(pdf_path, n))
+    if scanned_pages:
+        print(f"  Scanned (image-only pages, vision OCR): {len(scanned_pages)} page(s): "
+              f"{', '.join(map(str, scanned_pages))}")
 
     # Re-estimate cost based on actual complex page count only
     if complex_count < pages_to_process:
@@ -3582,6 +3621,8 @@ def main():
         # when MOCK_MODE=1 is forced).
         if os.environ.get("MOCK_MODE") == "1" or backends["mock"]:
             label = "mock"
+        elif page_num in scanned_pages:
+            label = "scanned"
         elif complexity == "simple":
             label = "simple"
         elif backends["ollama"]:
