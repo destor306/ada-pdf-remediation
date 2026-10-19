@@ -1197,6 +1197,113 @@ def set_page_size(section, width_in: float, height_in: float):
         section.orientation = WD_ORIENT.PORTRAIT
 
 
+def _render_docx_elements(doc, elements: list[dict], page_w: float,
+                          page_dims: list[tuple[float, float]] | None = None,
+                          page_idx: int = 0) -> None:
+    """Render vision elements into the DOCX body.
+
+    Shared by build_docx and the scanned-page transcription section.
+    `elements` must already be the body elements (header/footer split
+    is the caller's job).
+    """
+    for elem in elements:
+        etype = elem.get("type", "paragraph")
+        text = _clean_inline_text(elem.get("text", ""))
+
+        if etype == "heading":
+            level = max(1, min(6, elem.get("level", 2)))
+            p = doc.add_paragraph(style=f"Heading {level}")
+            p.add_run(text)
+
+        elif etype == "paragraph":
+            if text:
+                doc.add_paragraph(text)
+
+        elif etype == "table":
+            add_accessible_table(doc, elem.get("rows", []), elem.get("col_widths"), page_w)
+            doc.add_paragraph()
+
+        elif etype == "list":
+            style_name = "List Number" if elem.get("ordered") else "List Bullet"
+            for item in elem.get("items", []):
+                doc.add_paragraph(_clean_inline_text(item), style=style_name)
+
+        elif etype == "caption":
+            if text:
+                doc.add_paragraph(text, style="Caption")
+
+        elif etype == "form_field":
+            # Render an editable-looking placeholder so fields are never silently dropped
+            kind = elem.get("field_kind", "text")
+            label = _clean_inline_text(elem.get("label") or text)
+            if kind == "checkbox":
+                box = "☒" if elem.get("checked") else "☐"
+                doc.add_paragraph(f"{box} {label}".strip())
+            elif kind == "radio":
+                dot = "◉" if elem.get("checked") else "○"
+                doc.add_paragraph(f"{dot} {label}".strip())
+            elif kind == "dropdown":
+                opts = elem.get("options") or []
+                shown = f" ({', '.join(opts[:6])})" if opts else ""
+                doc.add_paragraph(f"{label}: [ select ▾ ]{shown}".strip() if label else f"[ select ▾ ]{shown}")
+            elif kind == "textarea":
+                if label:
+                    doc.add_paragraph(f"{label}:")
+                doc.add_paragraph("_" * 60)
+            else:  # text
+                doc.add_paragraph(f"{label}: ________".strip() if label else "________")
+
+        elif etype in ("image", "image_alt"):
+            img_bytes = elem.get("_image_bytes")
+            alt = elem.get("alt_text") or elem.get("text") or ""
+            caption_text = elem.get("caption", "")
+
+            if img_bytes:
+                # Embed the real extracted image
+                img_width  = elem.get("_image_width", 1)
+                img_height = elem.get("_image_height", 1)
+                # Fit within usable page width (page_w minus margins).
+                # Default to 70% width: full-width charts blow out pagination
+                # (was min(max_w, max_w) — a no-op that always used full width).
+                max_w = page_w - 1.5
+                aspect = img_height / img_width if img_width else 1
+                fit_w = max_w * 0.7
+                fit_h = fit_w * aspect
+                # If taller than half a page, shrink to fit
+                max_h = (page_dims[page_idx][1] if page_dims and page_idx < len(page_dims) else 11.0) * 0.5
+                if fit_h > max_h:
+                    fit_h = max_h
+                    fit_w = fit_h / aspect
+
+                p = doc.add_paragraph()
+                p.alignment = 1  # center
+                run = p.add_run()
+                run.add_picture(io.BytesIO(img_bytes), width=Inches(fit_w))
+
+                # Add alt text to the drawing XML
+                try:
+                    drawing = run._r.find('.//{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}inline')
+                    if drawing is not None:
+                        docPr = drawing.find('{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}docPr')
+                        if docPr is not None and alt:
+                            docPr.set('descr', alt)
+                except Exception:
+                    pass
+            else:
+                # Fallback: no image bytes extracted, show placeholder
+                p = doc.add_paragraph(f"[Figure: {alt}]")
+                if p.runs:
+                    p.runs[0].italic = True
+
+            if caption_text:
+                doc.add_paragraph(caption_text, style="Caption")
+
+        else:
+            # Never silently drop an element the model emitted — render its text
+            if text:
+                doc.add_paragraph(text)
+
+
 def build_docx(pages_data: list[dict], output_path: str, page_dims: list[tuple[float, float]] | None = None, title: str = ""):
     _normalize_heading_levels(pages_data)
     doc = Document()
@@ -1243,102 +1350,7 @@ def build_docx(pages_data: list[dict], output_path: str, page_dims: list[tuple[f
         else:
             page_w = 8.5  # default letter width
 
-        for elem in body_elems:
-            etype = elem.get("type", "paragraph")
-            text = _clean_inline_text(elem.get("text", ""))
-
-            if etype == "heading":
-                level = max(1, min(6, elem.get("level", 2)))
-                p = doc.add_paragraph(style=f"Heading {level}")
-                p.add_run(text)
-
-            elif etype == "paragraph":
-                if text:
-                    doc.add_paragraph(text)
-
-            elif etype == "table":
-                add_accessible_table(doc, elem.get("rows", []), elem.get("col_widths"), page_w)
-                doc.add_paragraph()
-
-            elif etype == "list":
-                style_name = "List Number" if elem.get("ordered") else "List Bullet"
-                for item in elem.get("items", []):
-                    doc.add_paragraph(_clean_inline_text(item), style=style_name)
-
-            elif etype == "caption":
-                if text:
-                    doc.add_paragraph(text, style="Caption")
-
-            elif etype == "form_field":
-                # Render an editable-looking placeholder so fields are never silently dropped
-                kind = elem.get("field_kind", "text")
-                label = _clean_inline_text(elem.get("label") or text)
-                if kind == "checkbox":
-                    box = "☒" if elem.get("checked") else "☐"
-                    doc.add_paragraph(f"{box} {label}".strip())
-                elif kind == "radio":
-                    dot = "◉" if elem.get("checked") else "○"
-                    doc.add_paragraph(f"{dot} {label}".strip())
-                elif kind == "dropdown":
-                    opts = elem.get("options") or []
-                    shown = f" ({', '.join(opts[:6])})" if opts else ""
-                    doc.add_paragraph(f"{label}: [ select ▾ ]{shown}".strip() if label else f"[ select ▾ ]{shown}")
-                elif kind == "textarea":
-                    if label:
-                        doc.add_paragraph(f"{label}:")
-                    doc.add_paragraph("_" * 60)
-                else:  # text
-                    doc.add_paragraph(f"{label}: ________".strip() if label else "________")
-
-            elif etype in ("image", "image_alt"):
-                img_bytes = elem.get("_image_bytes")
-                alt = elem.get("alt_text") or elem.get("text") or ""
-                caption_text = elem.get("caption", "")
-
-                if img_bytes:
-                    # Embed the real extracted image
-                    img_width  = elem.get("_image_width", 1)
-                    img_height = elem.get("_image_height", 1)
-                    # Fit within usable page width (page_w minus margins).
-                    # Default to 70% width: full-width charts blow out pagination
-                    # (was min(max_w, max_w) — a no-op that always used full width).
-                    max_w = page_w - 1.5
-                    aspect = img_height / img_width if img_width else 1
-                    fit_w = max_w * 0.7
-                    fit_h = fit_w * aspect
-                    # If taller than half a page, shrink to fit
-                    max_h = (page_dims[idx][1] if page_dims and idx < len(page_dims) else 11.0) * 0.5
-                    if fit_h > max_h:
-                        fit_h = max_h
-                        fit_w = fit_h / aspect
-
-                    p = doc.add_paragraph()
-                    p.alignment = 1  # center
-                    run = p.add_run()
-                    run.add_picture(io.BytesIO(img_bytes), width=Inches(fit_w))
-
-                    # Add alt text to the drawing XML
-                    try:
-                        drawing = run._r.find('.//{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}inline')
-                        if drawing is not None:
-                            docPr = drawing.find('{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}docPr')
-                            if docPr is not None and alt:
-                                docPr.set('descr', alt)
-                    except Exception:
-                        pass
-                else:
-                    # Fallback: no image bytes extracted, show placeholder
-                    p = doc.add_paragraph(f"[Figure: {alt}]")
-                    if p.runs:
-                        p.runs[0].italic = True
-
-                if caption_text:
-                    doc.add_paragraph(caption_text, style="Caption")
-
-            else:
-                # Never silently drop an element the model emitted — render its text
-                if text:
-                    doc.add_paragraph(text)
+        _render_docx_elements(doc, body_elems, page_w, page_dims, idx)
 
         if idx < len(pages_data) - 1:
             # Add page break and new section if page size changes
@@ -1918,11 +1930,137 @@ def _normalize_heading_levels(pages_data: list[dict]) -> None:
                 elem["level"] = 2
 
 
+# ---------------------------------------------------------------------------
+# Scanned-page invisible text layer (PDF side)
+# ---------------------------------------------------------------------------
+
+def _ensure_invisible_text_font(pdf, page_obj) -> str:
+    """Ensure a font resource exists for the synthetic invisible text layer.
+
+    Adds a standard Helvetica (WinAnsiEncoding) font to the nearest /Resources
+    dict (page or ancestor) so the synthetic Tj operators reference a real
+    font. Returns the font resource name. The text renders invisibly (3 Tr),
+    so glyph outlines never matter — the font only needs to exist for text
+    extraction and document validity.
+    """
+    from pikepdf import Dictionary, Name
+
+    # Walk up to the nearest /Resources dict without shadowing an inherited
+    # one — creating a fresh /Resources on the page would hide an ancestor's
+    # /XObject entries and break the scan image rendering.
+    node, resources = page_obj, None
+    seen = set()
+    while node is not None:
+        try:
+            og = node.objgen
+        except Exception:
+            og = None
+        if og in seen:
+            break
+        seen.add(og)
+        try:
+            if '/Resources' in node:
+                resources = node['/Resources']
+                break
+        except Exception:
+            pass
+        try:
+            node = node.get('/Parent')
+        except Exception:
+            node = None
+    if resources is None:
+        resources = Dictionary()
+        page_obj['/Resources'] = resources
+    if '/Font' not in resources:
+        resources['/Font'] = Dictionary()
+    fonts = resources['/Font']
+    if '/AccFxT1' not in fonts:
+        fonts['/AccFxT1'] = pdf.make_indirect(Dictionary(
+            Type=Name('/Font'),
+            Subtype=Name('/Type1'),
+            BaseFont=Name('/Helvetica'),
+            Encoding=Name('/WinAnsiEncoding'),
+        ))
+    return '/AccFxT1'
+
+
+def _synthesize_scanned_text_instructions(pdf, page_obj, elements) -> list:
+    """Build invisible (3 Tr) BT..ET blocks from vision elements in reading order.
+
+    Vision elements carry no bounding boxes, so blocks are positioned
+    top-to-bottom in element order. Position doesn't matter visually (the text
+    is never rendered); struct-tree order comes from the AI's reading order
+    via elem_order, not geometry. Tables/lists expand to one block per
+    cell/item so _match_blocks_to_elements matches them 1:1.
+    """
+    from pikepdf import ContentStreamInstruction, Operator, Name, String, Integer
+
+    try:
+        mb = page_obj['/MediaBox']
+        page_h = float(mb[3]) - float(mb[1])
+    except Exception:
+        page_h = 792.0
+    font_name = _ensure_invisible_text_font(pdf, page_obj)
+
+    instrs = []
+    y = page_h - 50.0
+    for elem in elements:
+        etype = elem.get('type', 'paragraph')
+        if etype == 'form_field':
+            # Form widgets are tagged via annotations; they have no matchable
+            # text block — synthesizing one would leave an orphan Artifact block.
+            continue
+        texts: list[str] = []
+        if etype == 'table':
+            for row in elem.get('rows', []):
+                for cell in row.get('cells', []):
+                    c = str(cell).strip()
+                    if c:
+                        texts.append(c)
+        elif etype == 'list':
+            for item in elem.get('items', []):
+                t = str(item).strip()
+                if t:
+                    texts.append(t)
+        else:
+            t = str(elem.get('text', '')).strip()
+            if t:
+                texts.append(t)
+        for t in texts:
+            data = t.encode('cp1252', errors='replace')
+            instrs.append(ContentStreamInstruction([], Operator('BT')))
+            instrs.append(ContentStreamInstruction(
+                [Name(font_name), Integer(10)], Operator('Tf')))
+            instrs.append(ContentStreamInstruction([Integer(3)], Operator('Tr')))
+            instrs.append(ContentStreamInstruction(
+                [Integer(1), Integer(0), Integer(0), Integer(1),
+                 Integer(50), Integer(int(y))],
+                Operator('Tm')))
+            instrs.append(ContentStreamInstruction([String(data)], Operator('Tj')))
+            instrs.append(ContentStreamInstruction([], Operator('ET')))
+            y -= 14.0
+            if y < 50.0:
+                y = page_h - 50.0
+    return instrs
+
+
+def _is_scanned_page(scanned_pages, page_idx: int, blocks: list, elements: list) -> bool:
+    """Explicit scanned-page set (from main()) wins; fallback: no text blocks
+    in the content stream but vision elements exist."""
+    if scanned_pages is not None:
+        return (page_idx + 1) in scanned_pages
+    has_text = any(
+        b['type'] == 'text' and b.get('text', '').strip() for b in blocks
+    )
+    return (not has_text) and bool(elements)
+
+
 def tag_pdf_with_accessibility(
     source_pdf: str,
     pages_data: list[dict],
     output_path: str,
     title: str = "",
+    scanned_pages: set[int] | None = None,
 ) -> None:
     """
     Create an accessible PDF by tagging the ORIGINAL document in-place.
@@ -1981,6 +2119,21 @@ def tag_pdf_with_accessibility(
                 raw_stream = pikepdf.parse_content_stream(page_obj)
                 clean_stream = _strip_marked_content(raw_stream)
                 blocks = _find_content_blocks(clean_stream)
+                # Scanned pages: the content stream is just the scan image.
+                # Synthesize an invisible text layer from the vision
+                # transcription, then run the unchanged match/inject pipeline.
+                is_scanned = _is_scanned_page(scanned_pages, page_idx, blocks, elements)
+                if is_scanned and elements:
+                    synth = _synthesize_scanned_text_instructions(pdf, page_obj, elements)
+                    if synth:
+                        clean_stream = clean_stream + synth
+                        blocks = _find_content_blocks(clean_stream)
+                        # The scan image is the visual layer — it must not
+                        # become a Figure. Dropping image blocks routes them
+                        # to /Artifact in _inject_mcids (standard OCR-PDF
+                        # practice: image = visual layer, invisible text =
+                        # content layer).
+                        blocks = [b for b in blocks if b['type'] != 'image']
                 assignments = _match_blocks_to_elements(blocks, elements) if elements else {}
             except Exception as e:
                 print(f"  [warn] Stream parse failed p{page_idx + 1}: {e}")
@@ -2546,16 +2699,24 @@ def make_docx_accessible(docx_path: str, pages_data: list[dict]) -> None:
     )
     for i, img_elem in enumerate(all_images):
         docPr = img_elem.find(f"{{{ns_wp}}}docPr")
-        if docPr is not None and not docPr.get("descr", "").strip():
-            if i < len(ai_alts):
-                # Vision model provided a real description for this image
-                docPr.set("descr", ai_alts[i])
-            else:
-                # No vision description available for this image. It's likely
-                # a pdf2docx artifact (tiny line, spacer, decorative element)
-                # rather than meaningful content. Mark as decorative so screen
-                # readers skip it instead of announcing "Figure".
-                docPr.set("decorative", "1")
+        if docPr is None:
+            continue
+        descr = (docPr.get("descr") or "").strip()
+        # pdf2docx pre-fills descr="Figure" as a placeholder — treat it as
+        # missing so real vision alt text (or the decorative mark) applies.
+        if descr and descr != "Figure":
+            continue  # real alt text already present — leave it
+        if i < len(ai_alts):
+            # Vision model provided a real description for this image
+            docPr.set("descr", ai_alts[i])
+        else:
+            # No vision description available for this image. It's likely
+            # a pdf2docx artifact (tiny line, spacer, decorative element)
+            # rather than meaningful content. Mark as decorative so screen
+            # readers skip it instead of announcing "Figure".
+            if "descr" in docPr.attrib:
+                del docPr.attrib["descr"]
+            docPr.set("decorative", "1")
 
     # Move footer/header text from body into actual DOCX section footer/header.
     # pdf2docx converts PDF drawString footer/header as body paragraphs — detect
@@ -3477,11 +3638,58 @@ def _merge_images_into_table(doc, paras) -> None:
         p._p.getparent().remove(p._p)
 
 
+def _append_scanned_transcription(docx_path: str, pages_data: list[dict],
+                                  scanned_pages: set[int],
+                                  page_dims: list[tuple[float, float]] | None = None) -> bool:
+    """Append a visible transcription section per scanned page (Jason's choice:
+    visible below the scan image — the DOCX is the editable deliverable, and a
+    scan has no real text layout to stay pixel-identical to).
+
+    Runs AFTER make_docx_accessible: the visual content is already reordered
+    to reading order, and re-running the reorder would interleave the
+    transcription with the visual blocks (identical text matches both).
+    Header/footer-typed elements render as plain body text here so the visual
+    document's section headers/footers are never clobbered.
+    """
+    from docx import Document
+
+    doc = Document(docx_path)
+    appended = False
+    for idx, page_data in enumerate(pages_data):
+        page_num = idx + 1
+        if page_num not in scanned_pages:
+            continue
+        elements = page_data.get('elements', [])
+        if not any(str(e.get('text', '')).strip() or e.get('type') in ('table', 'list')
+                   for e in elements):
+            continue
+        doc.add_heading(f"Scanned page {page_num} \u2014 transcribed text", level=1)
+        # Re-base heading levels gap-free under the H1 section title
+        adjusted: list[dict] = []
+        prev_level = 1
+        for e in elements:
+            if e.get('type') == 'heading':
+                level = max(1, min(6, e.get('level', 2)))
+                level = min(level, prev_level + 1)
+                e = dict(e)
+                e['level'] = level
+                prev_level = level
+            adjusted.append(e)
+        page_w = page_dims[idx][0] if (page_dims and idx < len(page_dims)) else 8.5
+        _render_docx_elements(doc, adjusted, page_w, page_dims, idx)
+        appended = True
+    if appended:
+        doc.core_properties.language = "en-US"
+        doc.save(docx_path)
+    return appended
+
+
 def convert_to_docx(    pdf_path: str,
     output_path: str,
     pages_data: list[dict],
     page_dims: list[tuple[float, float]] | None = None,
     title: str = "",
+    scanned_pages: set[int] | None = None,
 ) -> None:
     """
     Convert PDF to DOCX using pdf2docx for best visual fidelity, falling back to
@@ -3521,10 +3729,20 @@ def convert_to_docx(    pdf_path: str,
     if Path(output_path).exists():
         make_docx_accessible(output_path, pages_data)
 
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+    # Scanned pages: the pdf2docx visual build is image-only. Append the
+    # vision transcription as visible structured content below it (runs after
+    # make_docx_accessible so the reading-order reorder doesn't interleave
+    # the transcription with the visual blocks).
+    if scanned_pages is None:
+        scanned_pages = {n for n in range(1, len(pages_data) + 1)
+                         if page_is_scanned(pdf_path, n)}
+    if scanned_pages and Path(output_path).exists():
+        try:
+            if _append_scanned_transcription(output_path, pages_data, set(scanned_pages), page_dims):
+                print(f"  Scanned transcription appended for page(s): "
+                      f"{', '.join(map(str, sorted(scanned_pages)))}")
+        except Exception as e:
+            print(f"  [scanned transcription skipped: {e}]")
 
 def _parse_args():
     import argparse
@@ -3643,12 +3861,14 @@ def main():
     # (preserves all fonts, images, tables, and layout from the source PDF)
     print(f"\nTagging original PDF with accessibility structure → {pdf_output_path}")
     doc_title = Path(pdf_path).stem.replace("_", " ").title()
-    tag_pdf_with_accessibility(pdf_path, pages_data, pdf_output_path, title=doc_title)
+    tag_pdf_with_accessibility(pdf_path, pages_data, pdf_output_path, title=doc_title,
+                               scanned_pages=set(scanned_pages))
     print(f"  ✅ Accessible PDF created (visual appearance preserved).")
 
     # --- Step 7: Also build DOCX for editing ---
     print(f"\nBuilding editable .docx → {docx_output_path}")
-    convert_to_docx(pdf_path, docx_output_path, pages_data, page_dims=page_dims, title=doc_title)
+    convert_to_docx(pdf_path, docx_output_path, pages_data, page_dims=page_dims, title=doc_title,
+                    scanned_pages=set(scanned_pages))
 
     print(f"\nDone!")
     print(f"  PDF file (primary):  {pdf_output_path}  ← visually identical to source")
